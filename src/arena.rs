@@ -59,12 +59,10 @@ fn mmap_slab(size: usize) -> *mut u8 {
 }
 
 const NUM_SIZE_CLASSES: usize = 7;
-const SIZE_CLASS_SIZES: [usize; NUM_SIZE_CLASSES] = [8, 16, 32, 64, 128, 256, 512];
 const MAX_FREE_PER_CLASS: u16 = 512;
 
 #[inline]
 fn size_class_index(size: usize) -> Option<usize> {
-    // Only return Some for exact power-of-two matches
     match size {
         8 => Some(0),
         16 => Some(1),
@@ -81,6 +79,8 @@ fn size_class_index(size: usize) -> Option<usize> {
 struct SlabMeta {
     base: *mut u8,
     capacity: usize,
+    live_count: u32,
+    recyclable: bool,
 }
 
 #[repr(C)]
@@ -93,7 +93,7 @@ struct WorkerArena {
     active_end: usize,
     _pad: [usize; 3],
 
-    // Free list state
+    // Free list state (active slab only)
     free_heads: [*mut u8; NUM_SIZE_CLASSES],
     free_counts: [u16; NUM_SIZE_CLASSES],
     _pad2: u16,
@@ -125,6 +125,8 @@ impl WorkerArena {
         arena.slabs[0] = SlabMeta {
             base: slab_base,
             capacity: CONFIG.arena_slab_size,
+            live_count: 0,
+            recyclable: false,
         };
         arena.slab_count = 1;
     }
@@ -134,12 +136,12 @@ impl WorkerArena {
         let align = layout.align();
         let size = layout.size();
 
-        // Try free list for exact power-of-two sizes
         if let Some(cls) = size_class_index(size) {
             let head = self.free_heads[cls];
             if !head.is_null() && (head as usize) & (align - 1) == 0 {
                 self.free_heads[cls] = unsafe { *(head as *const *mut u8) };
                 self.free_counts[cls] -= 1;
+                self.slabs[self.active_slab].live_count += 1;
                 return head;
             }
         }
@@ -149,6 +151,7 @@ impl WorkerArena {
 
         if new_cursor <= self.capacity {
             self.cursor = new_cursor;
+            self.slabs[self.active_slab].live_count += 1;
             return unsafe { self.base.add(aligned) };
         }
 
@@ -165,6 +168,7 @@ impl WorkerArena {
         let new_cursor = aligned + size;
         if new_cursor <= self.capacity {
             self.cursor = new_cursor;
+            self.slabs[self.active_slab].live_count += 1;
             unsafe { self.base.add(aligned) }
         } else {
             std::ptr::null_mut()
@@ -175,13 +179,13 @@ impl WorkerArena {
     fn dealloc_notify(&mut self, ptr: *mut u8, size: usize) -> bool {
         let addr = ptr as usize;
 
-        // Fast path: active slab
         if addr >= self.active_base && addr < self.active_end {
+            self.slabs[self.active_slab].live_count -= 1;
             self.maybe_free_list(ptr, size);
             return true;
         }
 
-        self.dealloc_notify_slow(addr, ptr, size)
+        self.dealloc_notify_slow(addr, size)
     }
 
     #[inline]
@@ -201,11 +205,11 @@ impl WorkerArena {
 
     #[cold]
     #[inline(never)]
-    fn dealloc_notify_slow(&mut self, addr: usize, ptr: *mut u8, size: usize) -> bool {
+    fn dealloc_notify_slow(&mut self, addr: usize, size: usize) -> bool {
         for i in 0..self.slab_count {
             let base = self.slabs[i].base as usize;
             if addr >= base && addr < base + self.slabs[i].capacity {
-                self.maybe_free_list(ptr, size);
+                self.slabs[i].live_count -= 1;
                 return true;
             }
         }
@@ -214,6 +218,17 @@ impl WorkerArena {
     }
 
     fn grow(&mut self) {
+        // Try to recycle a dead slab first
+        for i in 0..self.slab_count {
+            if i != self.active_slab && self.slabs[i].recyclable {
+                self.slabs[i].recyclable = false;
+                self.slabs[i].live_count = 0;
+                self.clear_free_lists();
+                self.activate_slab(i);
+                return;
+            }
+        }
+
         if self.slab_count < MAX_SLABS_PER_ARENA {
             let new_size = CONFIG.arena_slab_size;
             let new_base = mmap_slab(new_size);
@@ -225,8 +240,11 @@ impl WorkerArena {
             self.slabs[idx] = SlabMeta {
                 base: new_base,
                 capacity: new_size,
+                live_count: 0,
+                recyclable: false,
             };
             self.slab_count += 1;
+            self.clear_free_lists();
             self.activate_slab(idx);
         }
     }
@@ -253,6 +271,34 @@ impl WorkerArena {
         self.cursor = 0;
         self.active_base = self.base as usize;
         self.active_end = self.base as usize + self.capacity;
+    }
+
+    fn clear_free_lists(&mut self) {
+        self.free_heads = [std::ptr::null_mut(); NUM_SIZE_CLASSES];
+        self.free_counts = [0; NUM_SIZE_CLASSES];
+    }
+
+    fn reclaim_dead_slabs(&mut self) {
+        for i in 0..self.slab_count {
+            if i == self.active_slab {
+                continue;
+            }
+            if self.slabs[i].live_count == 0 && !self.slabs[i].recyclable {
+                unsafe {
+                    libc::madvise(
+                        self.slabs[i].base as *mut libc::c_void,
+                        self.slabs[i].capacity,
+                        libc::MADV_DONTNEED,
+                    );
+                }
+                self.slabs[i].recyclable = true;
+            }
+        }
+        // If active slab is also dead, reset its cursor for reuse
+        if self.slabs[self.active_slab].live_count == 0 {
+            self.cursor = 0;
+            self.clear_free_lists();
+        }
     }
 }
 
@@ -330,24 +376,13 @@ pub unsafe fn try_grow_in_place(ptr: *mut u8, old_size: usize, new_size: usize) 
 
 pub(crate) fn compact_pools() {}
 
-pub(crate) fn reset_arena() {
+pub(crate) fn reclaim_dead_slabs() {
     ARENA_PTR.with(|cell| {
         let ptr = cell.get();
         if ptr.is_null() {
             return;
         }
         let arena = unsafe { &mut *ptr };
-        arena.activate_slab(0);
-        arena.free_heads = [std::ptr::null_mut(); NUM_SIZE_CLASSES];
-        arena.free_counts = [0; NUM_SIZE_CLASSES];
-        for i in 1..arena.slab_count {
-            unsafe {
-                libc::madvise(
-                    arena.slabs[i].base as *mut libc::c_void,
-                    arena.slabs[i].capacity,
-                    libc::MADV_DONTNEED,
-                );
-            }
-        }
+        arena.reclaim_dead_slabs();
     });
 }
