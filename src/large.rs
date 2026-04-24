@@ -1,5 +1,7 @@
 use std::alloc::Layout;
 
+use crate::config::CONFIG;
+
 pub unsafe fn alloc_large(layout: Layout) -> *mut u8 {
     let size = layout.size();
     let ptr = libc::mmap(
@@ -15,8 +17,9 @@ pub unsafe fn alloc_large(layout: Layout) -> *mut u8 {
         return std::ptr::null_mut();
     }
 
-    // Opportunistic transparent huge pages for large polynomial buffers
-    libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_HUGEPAGE);
+    if size >= CONFIG.huge_page_threshold {
+        libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_HUGEPAGE);
+    }
 
     ptr
 }

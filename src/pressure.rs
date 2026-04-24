@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use crate::config::CONFIG;
+
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RetentionPolicy {
@@ -36,10 +38,12 @@ fn detect_pressure() -> RetentionPolicy {
 
     let utilization = (rss_kb * 100) / available_kb;
 
-    match utilization {
-        0..=49 => RetentionPolicy::Eager,
-        50..=79 => RetentionPolicy::Moderate,
-        _ => RetentionPolicy::Aggressive,
+    if utilization <= CONFIG.pressure_eager_pct as u64 {
+        RetentionPolicy::Eager
+    } else if utilization >= CONFIG.pressure_aggressive_pct as u64 {
+        RetentionPolicy::Aggressive
+    } else {
+        RetentionPolicy::Moderate
     }
 }
 

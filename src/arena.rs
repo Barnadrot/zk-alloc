@@ -1,8 +1,9 @@
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 
-const ARENA_SIZE: usize = 16 * 1024 * 1024; // 16MB per thread
-const NUM_SIZE_CLASSES: usize = 12; // 1KB, 2KB, 4KB, ..., 2MB
+use crate::config::CONFIG;
+
+const MAX_POOL_CLASSES: usize = 16;
 
 struct BumpRegion {
     base: *mut u8,
@@ -20,16 +21,17 @@ struct FreeNode {
 
 struct WorkerArena {
     bump: BumpRegion,
-    pools: [FreeList; NUM_SIZE_CLASSES],
+    pools: [FreeList; MAX_POOL_CLASSES],
     _phase_watermark: usize,
 }
 
 impl WorkerArena {
     fn new() -> Self {
+        let slab_size = CONFIG.arena_slab_size;
         let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                ARENA_SIZE,
+                slab_size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -41,9 +43,9 @@ impl WorkerArena {
             bump: BumpRegion {
                 base,
                 cursor: 0,
-                capacity: ARENA_SIZE,
+                capacity: slab_size,
             },
-            pools: [const { FreeList { head: std::ptr::null_mut() } }; NUM_SIZE_CLASSES],
+            pools: [const { FreeList { head: std::ptr::null_mut() } }; MAX_POOL_CLASSES],
             _phase_watermark: 0,
         }
     }
@@ -71,8 +73,9 @@ impl WorkerArena {
             return node as *mut u8;
         }
 
-        let pool_size = 1 << (class + 10); // 1KB, 2KB, 4KB, ...
-        let alloc_layout = unsafe { Layout::from_size_align_unchecked(pool_size, layout.align().max(8)) };
+        let pool_size = 1 << (CONFIG.pool_base_shift + class);
+        let alloc_layout =
+            unsafe { Layout::from_size_align_unchecked(pool_size, layout.align().max(8)) };
         self.alloc_bump(alloc_layout)
     }
 
@@ -89,7 +92,7 @@ impl WorkerArena {
     fn reset(&mut self) {
         self.bump.cursor = 0;
         self._phase_watermark = 0;
-        for pool in &mut self.pools {
+        for pool in &mut self.pools[..CONFIG.num_pool_classes] {
             pool.head = std::ptr::null_mut();
         }
     }
@@ -97,9 +100,10 @@ impl WorkerArena {
 
 #[inline]
 fn pool_class(size: usize) -> usize {
-    // Map size to pool index: 0=1KB, 1=2KB, ..., 11=2MB
-    let size = size.max(1024);
-    (usize::BITS - size.leading_zeros()) as usize - 10
+    let min_pool = 1 << CONFIG.pool_base_shift;
+    let size = size.max(min_pool);
+    let class = (usize::BITS - size.leading_zeros()) as usize - CONFIG.pool_base_shift;
+    class.min(CONFIG.num_pool_classes - 1)
 }
 
 thread_local! {
@@ -140,7 +144,6 @@ pub unsafe fn alloc_medium(layout: Layout) -> *mut u8 {
 }
 
 pub unsafe fn dealloc_medium(ptr: *mut u8, layout: Layout) {
-    // Return to size-class free list for reuse within this phase
     with_arena(|a| a.dealloc_pool(ptr, layout));
 }
 

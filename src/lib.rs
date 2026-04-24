@@ -1,6 +1,7 @@
 use std::alloc::{GlobalAlloc, Layout};
 
 mod arena;
+pub mod config;
 mod large;
 mod phase;
 mod pressure;
@@ -11,19 +12,21 @@ pub struct ZkAllocator;
 
 unsafe impl GlobalAlloc for ZkAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        match layout.size() {
+        let size = layout.size();
+        match size {
             0 => layout.align() as *mut u8,
-            1..=512 => arena::alloc_small(layout),
-            513..=2_097_152 => arena::alloc_medium(layout),
+            s if s <= config::CONFIG.small_threshold => arena::alloc_small(layout),
+            s if s <= config::CONFIG.medium_threshold => arena::alloc_medium(layout),
             _ => large::alloc_large(layout),
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        match layout.size() {
+        let size = layout.size();
+        match size {
             0 => {}
-            1..=512 => arena::dealloc_small(ptr, layout),
-            513..=2_097_152 => arena::dealloc_medium(ptr, layout),
+            s if s <= config::CONFIG.small_threshold => arena::dealloc_small(ptr, layout),
+            s if s <= config::CONFIG.medium_threshold => arena::dealloc_medium(ptr, layout),
             _ => large::dealloc_large(ptr, layout),
         }
     }
@@ -50,8 +53,8 @@ unsafe impl GlobalAlloc for ZkAllocator {
 fn size_class(size: usize) -> u8 {
     match size {
         0 => 0,
-        1..=512 => 1,
-        513..=2_097_152 => 2,
+        s if s <= config::CONFIG.small_threshold => 1,
+        s if s <= config::CONFIG.medium_threshold => 2,
         _ => 3,
     }
 }
