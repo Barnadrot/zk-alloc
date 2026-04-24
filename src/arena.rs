@@ -72,7 +72,6 @@ fn mmap_slab(size: usize) -> *mut u8 {
     if ptr != libc::MAP_FAILED {
         return ptr as *mut u8;
     }
-    // Fallback: regular pages with THP advisory
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -92,21 +91,22 @@ fn mmap_slab(size: usize) -> *mut u8 {
     ptr as *mut u8
 }
 
-const NUM_SIZE_CLASSES: usize = 7;
-const MAX_FREE_PER_CLASS: u16 = 512;
+const NUM_SIZE_CLASSES: usize = 10;
+const SIZE_CLASSES: [usize; NUM_SIZE_CLASSES] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
 #[inline]
 fn size_class_index(size: usize) -> Option<usize> {
-    match size {
-        8 => Some(0),
-        16 => Some(1),
-        32 => Some(2),
-        64 => Some(3),
-        128 => Some(4),
-        256 => Some(5),
-        512 => Some(6),
-        _ => None,
-    }
+    if size <= 8 { return Some(0); }
+    if size <= 16 { return Some(1); }
+    if size <= 32 { return Some(2); }
+    if size <= 64 { return Some(3); }
+    if size <= 128 { return Some(4); }
+    if size <= 256 { return Some(5); }
+    if size <= 512 { return Some(6); }
+    if size <= 1024 { return Some(7); }
+    if size <= 2048 { return Some(8); }
+    if size <= 4096 { return Some(9); }
+    None
 }
 
 #[derive(Clone, Copy)]
@@ -127,8 +127,7 @@ struct WorkerArena {
 
     // Free list state
     free_heads: [*mut u8; NUM_SIZE_CLASSES],
-    free_counts: [u16; NUM_SIZE_CLASSES],
-    _pad2: u16,
+    free_counts: [u32; NUM_SIZE_CLASSES],
 
     // Cold: slab management
     active_slab: usize,
@@ -152,7 +151,6 @@ impl WorkerArena {
         arena._pad = [0; 3];
         arena.free_heads = [std::ptr::null_mut(); NUM_SIZE_CLASSES];
         arena.free_counts = [0; NUM_SIZE_CLASSES];
-        arena._pad2 = 0;
         arena.active_slab = 0;
         arena.slabs[0] = SlabMeta {
             base: slab_base,
@@ -173,6 +171,15 @@ impl WorkerArena {
                 self.free_counts[cls] -= 1;
                 return head;
             }
+            // Bump-allocate the class size for free-list consistency
+            let class_size = SIZE_CLASSES[cls];
+            let aligned = (self.cursor + align - 1) & !(align - 1);
+            let new_cursor = aligned + class_size;
+            if new_cursor <= self.capacity {
+                self.cursor = new_cursor;
+                return unsafe { self.base.add(aligned) };
+            }
+            return self.alloc_bump_slow_class(align, class_size);
         }
 
         let aligned = (self.cursor + align - 1) & !(align - 1);
@@ -184,6 +191,20 @@ impl WorkerArena {
         }
 
         self.alloc_bump_slow(layout)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_bump_slow_class(&mut self, align: usize, class_size: usize) -> *mut u8 {
+        self.grow();
+        let aligned = (self.cursor + align - 1) & !(align - 1);
+        let new_cursor = aligned + class_size;
+        if new_cursor <= self.capacity {
+            self.cursor = new_cursor;
+            unsafe { self.base.add(aligned) }
+        } else {
+            std::ptr::null_mut()
+        }
     }
 
     #[cold]
@@ -217,9 +238,7 @@ impl WorkerArena {
     #[inline]
     fn maybe_free_list(&mut self, ptr: *mut u8, size: usize) {
         if let Some(cls) = size_class_index(size) {
-            if self.free_counts[cls] < MAX_FREE_PER_CLASS
-                && (ptr as usize) & 7 == 0
-            {
+            if (ptr as usize) & 7 == 0 {
                 unsafe {
                     *(ptr as *mut *mut u8) = self.free_heads[cls];
                 }
@@ -231,10 +250,11 @@ impl WorkerArena {
 
     #[cold]
     #[inline(never)]
-    fn dealloc_notify_slow(&mut self, addr: usize, _ptr: *mut u8, _size: usize) -> bool {
+    fn dealloc_notify_slow(&mut self, addr: usize, ptr: *mut u8, size: usize) -> bool {
         for i in 0..self.slab_count {
             let base = self.slabs[i].base as usize;
             if addr >= base && addr < base + self.slabs[i].capacity {
+                self.maybe_free_list(ptr, size);
                 return true;
             }
         }
