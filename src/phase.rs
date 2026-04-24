@@ -13,5 +13,5 @@ use crate::pressure;
 /// `rayon::broadcast` or at a join point.
 pub fn phase_boundary() {
     pressure::update_policy();
-    arena::reset_arena();
+    arena::compact_pools();
 }

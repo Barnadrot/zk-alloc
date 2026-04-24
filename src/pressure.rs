@@ -12,6 +12,7 @@ pub enum RetentionPolicy {
 
 static POLICY: AtomicU8 = AtomicU8::new(RetentionPolicy::Moderate as u8);
 
+#[allow(dead_code)]
 pub fn current_policy() -> RetentionPolicy {
     match POLICY.load(Ordering::Relaxed) {
         0 => RetentionPolicy::Eager,

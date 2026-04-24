@@ -25,7 +25,7 @@ pub struct ZkAllocConfig {
 }
 
 pub const DEFAULT: ZkAllocConfig = ZkAllocConfig {
-    arena_slab_size: 16 * 1024 * 1024,  // 16MB
+    arena_slab_size: 256 * 1024 * 1024,  // 256MB
     small_threshold: 512,
     medium_threshold: 2 * 1024 * 1024,  // 2MB
     num_pool_classes: 12,
