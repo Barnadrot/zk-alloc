@@ -12,6 +12,7 @@ use crate::pressure;
 /// For full reset across all Rayon workers, call from within a
 /// `rayon::broadcast` or at a join point.
 pub fn phase_boundary() {
+    arena::reset_arena();
     pressure::update_policy();
     arena::compact_pools();
 }

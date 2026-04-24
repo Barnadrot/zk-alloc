@@ -329,3 +329,25 @@ pub unsafe fn try_grow_in_place(ptr: *mut u8, old_size: usize, new_size: usize) 
 }
 
 pub(crate) fn compact_pools() {}
+
+pub(crate) fn reset_arena() {
+    ARENA_PTR.with(|cell| {
+        let ptr = cell.get();
+        if ptr.is_null() {
+            return;
+        }
+        let arena = unsafe { &mut *ptr };
+        arena.activate_slab(0);
+        arena.free_heads = [std::ptr::null_mut(); NUM_SIZE_CLASSES];
+        arena.free_counts = [0; NUM_SIZE_CLASSES];
+        for i in 1..arena.slab_count {
+            unsafe {
+                libc::madvise(
+                    arena.slabs[i].base as *mut libc::c_void,
+                    arena.slabs[i].capacity,
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
+    });
+}
