@@ -238,7 +238,9 @@ impl WorkerArena {
     #[inline]
     fn maybe_free_list(&mut self, ptr: *mut u8, size: usize) {
         if let Some(cls) = size_class_index(size) {
-            if (ptr as usize) & 7 == 0 {
+            if self.free_counts[cls] < 65536
+                && (ptr as usize) & 7 == 0
+            {
                 unsafe {
                     *(ptr as *mut *mut u8) = self.free_heads[cls];
                 }
@@ -250,11 +252,10 @@ impl WorkerArena {
 
     #[cold]
     #[inline(never)]
-    fn dealloc_notify_slow(&mut self, addr: usize, ptr: *mut u8, size: usize) -> bool {
+    fn dealloc_notify_slow(&mut self, addr: usize, _ptr: *mut u8, _size: usize) -> bool {
         for i in 0..self.slab_count {
             let base = self.slabs[i].base as usize;
             if addr >= base && addr < base + self.slabs[i].capacity {
-                self.maybe_free_list(ptr, size);
                 return true;
             }
         }
