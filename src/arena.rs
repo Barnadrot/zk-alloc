@@ -1,8 +1,9 @@
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::Layout;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::CONFIG;
+use crate::syscall;
 
 const MAX_GLOBAL_SLABS: usize = 256;
 const MAX_SLABS_PER_ARENA: usize = 16;
@@ -18,6 +19,8 @@ static SLAB_ENDS: [AtomicUsize; MAX_GLOBAL_SLABS] = {
 static SLAB_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ARENA_ADDR_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static ARENA_ADDR_MAX: AtomicUsize = AtomicUsize::new(0);
+static COMPACT_GENERATION: AtomicUsize = AtomicUsize::new(0);
+static ARENA_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn register_slab(base: *mut u8, capacity: usize) -> usize {
     let idx = SLAB_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -58,37 +61,37 @@ fn is_any_arena(addr: usize) -> bool {
         && addr < ARENA_ADDR_MAX.load(Ordering::Relaxed)
 }
 
-fn mmap_slab(size: usize) -> *mut u8 {
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
-            -1,
-            0,
-        )
-    };
-    if ptr != libc::MAP_FAILED {
-        return ptr as *mut u8;
+fn is_any_slab(addr: usize) -> bool {
+    let count = SLAB_COUNT.load(Ordering::Acquire);
+    for i in 0..count {
+        let end = SLAB_ENDS[i].load(Ordering::Acquire);
+        if end == 0 {
+            continue;
+        }
+        let base = SLAB_BASES[i].load(Ordering::Relaxed);
+        if addr >= base && addr < end {
+            return true;
+        }
     }
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
+    false
+}
+
+#[inline]
+pub(crate) fn is_arena_active() -> bool {
+    ARENA_ACTIVE.load(Ordering::Relaxed)
+}
+
+fn mmap_slab(size: usize) -> *mut u8 {
+    let ptr = unsafe { syscall::mmap_anonymous(size, true) };
+    if !ptr.is_null() {
+        return ptr;
+    }
+    let ptr = unsafe { syscall::mmap_anonymous(size, false) };
+    if ptr.is_null() {
         return std::ptr::null_mut();
     }
-    unsafe {
-        libc::madvise(ptr, size, libc::MADV_HUGEPAGE);
-    }
-    ptr as *mut u8
+    unsafe { syscall::madvise(ptr, size, syscall::MADV_HUGEPAGE) };
+    ptr
 }
 
 const NUM_SIZE_CLASSES: usize = 10;
@@ -133,6 +136,7 @@ struct WorkerArena {
     active_slab: usize,
     slabs: [SlabMeta; MAX_SLABS_PER_ARENA],
     slab_count: usize,
+    compact_generation: usize,
 }
 
 impl WorkerArena {
@@ -157,6 +161,7 @@ impl WorkerArena {
             capacity: CONFIG.arena_slab_size,
         };
         arena.slab_count = 1;
+        arena.compact_generation = COMPACT_GENERATION.load(Ordering::Relaxed);
     }
 
     #[inline]
@@ -171,7 +176,6 @@ impl WorkerArena {
                 self.free_counts[cls] -= 1;
                 return head;
             }
-            // Bump-allocate the class size for free-list consistency
             let class_size = SIZE_CLASSES[cls];
             let aligned = (self.cursor + align - 1) & !(align - 1);
             let new_cursor = aligned + class_size;
@@ -179,7 +183,7 @@ impl WorkerArena {
                 self.cursor = new_cursor;
                 return unsafe { self.base.add(aligned) };
             }
-            return self.alloc_bump_slow_class(align, class_size);
+            return self.alloc_bump_slow(layout);
         }
 
         let aligned = (self.cursor + align - 1) & !(align - 1);
@@ -191,20 +195,6 @@ impl WorkerArena {
         }
 
         self.alloc_bump_slow(layout)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn alloc_bump_slow_class(&mut self, align: usize, class_size: usize) -> *mut u8 {
-        self.grow();
-        let aligned = (self.cursor + align - 1) & !(align - 1);
-        let new_cursor = aligned + class_size;
-        if new_cursor <= self.capacity {
-            self.cursor = new_cursor;
-            unsafe { self.base.add(aligned) }
-        } else {
-            std::ptr::null_mut()
-        }
     }
 
     #[cold]
@@ -260,10 +250,15 @@ impl WorkerArena {
             }
         }
 
-        is_any_arena(addr)
+        is_any_slab(addr)
     }
 
     fn grow(&mut self) {
+        let next = self.active_slab + 1;
+        if next < self.slab_count {
+            self.activate_slab(next);
+            return;
+        }
         if self.slab_count < MAX_SLABS_PER_ARENA {
             let new_size = CONFIG.arena_slab_size;
             let new_base = mmap_slab(new_size);
@@ -304,6 +299,13 @@ impl WorkerArena {
         self.active_base = self.base as usize;
         self.active_end = self.base as usize + self.capacity;
     }
+
+    fn compact(&mut self) {
+        self.activate_slab(0);
+        self.free_heads = [std::ptr::null_mut(); NUM_SIZE_CLASSES];
+        self.free_counts = [0; NUM_SIZE_CLASSES];
+    }
+
 }
 
 thread_local! {
@@ -321,61 +323,55 @@ where
             let size = std::mem::size_of::<WorkerArena>();
             let page_size = 4096;
             let alloc_size = (size + page_size - 1) & !(page_size - 1);
-            let raw = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    alloc_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            if raw == libc::MAP_FAILED {
+            let raw = unsafe { syscall::mmap_anonymous(alloc_size, false) };
+            if raw.is_null() {
                 std::process::abort();
             }
             ptr = raw as *mut WorkerArena;
             WorkerArena::init(unsafe { &mut *ptr });
             cell.set(ptr);
         }
-        f(unsafe { &mut *ptr })
+        let arena = unsafe { &mut *ptr };
+        let global_gen = COMPACT_GENERATION.load(Ordering::Relaxed);
+        if arena.compact_generation != global_gen {
+            arena.compact();
+            arena.compact_generation = global_gen;
+        }
+        f(arena)
     })
 }
 
-pub unsafe fn alloc_small(layout: Layout) -> *mut u8 {
-    let ptr = with_arena(|a| a.alloc_bump(layout));
-    if ptr.is_null() {
-        std::alloc::System.alloc(layout)
-    } else {
-        ptr
-    }
+#[inline]
+pub unsafe fn arena_alloc(layout: Layout) -> *mut u8 {
+    with_arena(|a| a.alloc_bump(layout))
 }
 
-pub unsafe fn dealloc_small(ptr: *mut u8, layout: Layout) {
-    let handled = with_arena(|a| a.dealloc_notify(ptr, layout.size()));
-    if !handled {
-        std::alloc::System.dealloc(ptr, layout);
-    }
-}
-
-pub unsafe fn alloc_medium(layout: Layout) -> *mut u8 {
-    let ptr = with_arena(|a| a.alloc_bump(layout));
-    if ptr.is_null() {
-        std::alloc::System.alloc(layout)
-    } else {
-        ptr
-    }
-}
-
-pub unsafe fn dealloc_medium(ptr: *mut u8, layout: Layout) {
-    let handled = with_arena(|a| a.dealloc_notify(ptr, layout.size()));
-    if !handled {
-        std::alloc::System.dealloc(ptr, layout);
-    }
+#[inline]
+pub unsafe fn arena_dealloc(ptr: *mut u8, size: usize) -> bool {
+    ARENA_PTR.with(|cell| {
+        let arena_ptr = cell.get();
+        if arena_ptr.is_null() {
+            return false;
+        }
+        let arena = &mut *arena_ptr;
+        let global_gen = COMPACT_GENERATION.load(Ordering::Relaxed);
+        if arena.compact_generation != global_gen {
+            arena.compact();
+            arena.compact_generation = global_gen;
+        }
+        arena.dealloc_notify(ptr, size)
+    })
 }
 
 pub unsafe fn try_grow_in_place(ptr: *mut u8, old_size: usize, new_size: usize) -> bool {
     with_arena(|a| a.try_grow_in_place(ptr, old_size, new_size))
 }
 
-pub(crate) fn compact_pools() {}
+pub(crate) fn compact_pools() {
+    ARENA_ACTIVE.store(true, Ordering::Relaxed);
+    COMPACT_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn deactivate() {
+    ARENA_ACTIVE.store(false, Ordering::Relaxed);
+}
