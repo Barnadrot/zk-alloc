@@ -2,6 +2,7 @@
 #include <dlfcn.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 
@@ -14,7 +15,7 @@ static void* (*real_memalign)(size_t, size_t) = NULL;
 static char bootstrap_buf[131072];
 static size_t bootstrap_pos = 0;
 
-#define SLAB_SIZE    ((size_t)4 * 1024 * 1024 * 1024)
+#define SLAB_SIZE    ((size_t)8 * 1024 * 1024 * 1024)
 #define MAX_THREADS  16
 #define REGION_SIZE  (SLAB_SIZE * MAX_THREADS)
 
@@ -36,8 +37,9 @@ static void ensure_region(void) {
     if (__sync_bool_compare_and_swap(&region_init_done, 0, 2)) {
         void* p = mmap(NULL, REGION_SIZE,
                        PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (p == MAP_FAILED) {
+            fprintf(stderr, "zk-alloc: mmap(%zuGB) FAILED\n", REGION_SIZE / (1024*1024*1024));
             region_init_done = 1;
             return;
         }
