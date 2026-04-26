@@ -12,7 +12,7 @@ static GENERATION: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_IMPL: AtomicUsize = AtomicUsize::new(0);
 static WARMUP_DONE: AtomicUsize = AtomicUsize::new(0);
 
-const SLAB_SIZE: usize = 4 * 1024 * 1024 * 1024; // 4GB
+const SLAB_SIZE: usize = 8 * 1024 * 1024 * 1024; // 8GB
 const MAX_THREADS: usize = 16;
 const REGION_SIZE: usize = SLAB_SIZE * MAX_THREADS;
 

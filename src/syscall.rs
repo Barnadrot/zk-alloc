@@ -7,6 +7,7 @@ const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
 const MAP_PRIVATE: usize = 0x02;
 const MAP_ANONYMOUS: usize = 0x20;
+const MAP_NORESERVE: usize = 0x4000;
 const MAP_HUGETLB: usize = 0x40000;
 
 pub const MADV_HUGEPAGE: usize = 14;
@@ -50,7 +51,7 @@ unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> isize {
 
 #[inline]
 pub unsafe fn mmap_anonymous(size: usize, hugetlb: bool) -> *mut u8 {
-    let flags = MAP_PRIVATE | MAP_ANONYMOUS | if hugetlb { MAP_HUGETLB } else { 0 };
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | if hugetlb { MAP_HUGETLB } else { 0 };
     let ret = syscall6(SYS_MMAP, 0, size, PROT_READ | PROT_WRITE, flags, usize::MAX, 0);
     if ret < 0 {
         ptr::null_mut()
