@@ -1,4 +1,4 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion};
 use std::alloc::{GlobalAlloc, Layout};
 
 use zk_alloc::ZkAllocator;
@@ -38,5 +38,24 @@ fn bench_large_alloc(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_small_alloc, bench_medium_alloc, bench_large_alloc);
+fn bench_arena_bump(c: &mut Criterion) {
+    zk_alloc::phase_boundary(); // warmup
+    zk_alloc::phase_boundary(); // activate
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    c.bench_function("arena_bump_64B", |b| {
+        b.iter(|| unsafe {
+            let ptr = ZK.alloc(layout);
+            std::hint::black_box(ptr);
+        });
+    });
+    zk_alloc::deactivate_arena();
+}
+
+criterion_group!(
+    benches,
+    bench_small_alloc,
+    bench_medium_alloc,
+    bench_large_alloc,
+    bench_arena_bump,
+);
 criterion_main!(benches);
