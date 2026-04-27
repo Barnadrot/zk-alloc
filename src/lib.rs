@@ -11,6 +11,8 @@ pub struct ZkAllocator;
 static GENERATION: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_IMPL: AtomicUsize = AtomicUsize::new(0);
 static WARMUP_DONE: AtomicUsize = AtomicUsize::new(0);
+static OVERFLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
+static OVERFLOW_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 const SLAB_SIZE: usize = 8 * 1024 * 1024 * 1024; // 8GB
 const MAX_THREADS: usize = 16;
@@ -28,7 +30,7 @@ fn ensure_region() -> usize {
         if ptr.is_null() {
             std::process::abort();
         }
-        unsafe { syscall::madvise(ptr, REGION_SIZE, syscall::MADV_HUGEPAGE) };
+        unsafe { syscall::madvise(ptr, REGION_SIZE, syscall::MADV_NOHUGEPAGE) };
         REGION_BASE.store(ptr as usize, Ordering::Release);
     });
     REGION_BASE.load(Ordering::Acquire)
@@ -53,6 +55,18 @@ pub fn phase_boundary() {
 
 pub fn deactivate_arena() {
     ALLOC_IMPL.store(0, Ordering::Release);
+}
+
+pub fn overflow_stats() -> (usize, usize) {
+    (
+        OVERFLOW_COUNT.load(Ordering::Relaxed),
+        OVERFLOW_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+pub fn reset_overflow_stats() {
+    OVERFLOW_COUNT.store(0, Ordering::Relaxed);
+    OVERFLOW_BYTES.store(0, Ordering::Relaxed);
 }
 
 #[cold]
@@ -96,6 +110,8 @@ unsafe fn arena_alloc_cold(size: usize, align: usize) -> *mut u8 {
         }
     }
     // SAFETY: size and align are from a valid Layout (caller contract).
+    OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
+    OVERFLOW_BYTES.fetch_add(size, Ordering::Relaxed);
     unsafe { std::alloc::System.alloc(Layout::from_size_align_unchecked(size, align)) }
 }
 

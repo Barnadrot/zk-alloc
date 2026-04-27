@@ -14,6 +14,7 @@ const MAP_NORESERVE: usize = 0x4000;
 const MAP_HUGETLB: usize = 0x40000;
 
 pub const MADV_HUGEPAGE: usize = 14;
+pub const MADV_NOHUGEPAGE: usize = 15;
 
 #[inline]
 unsafe fn syscall6(
