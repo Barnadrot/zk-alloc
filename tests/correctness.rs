@@ -91,7 +91,7 @@ fn phase_boundary_does_not_crash() {
         assert!(!ptr.is_null());
         unsafe { ZK.dealloc(ptr, layout) };
     }
-    zk_alloc::phase_boundary();
+    zk_alloc::begin_phase();
     for _ in 0..10 {
         let ptr = unsafe { ZK.alloc(layout) };
         assert!(!ptr.is_null());
@@ -126,8 +126,8 @@ fn cross_thread_dealloc_does_not_crash() {
 
 #[test]
 fn arena_active_allocation() {
-    zk_alloc::phase_boundary();
-    zk_alloc::phase_boundary();
+    zk_alloc::begin_phase();
+    zk_alloc::begin_phase();
 
     let layout = Layout::from_size_align(4096, 8).unwrap();
     let mut ptrs = Vec::with_capacity(100);
@@ -139,7 +139,7 @@ fn arena_active_allocation() {
         ptrs.push(p);
     }
 
-    zk_alloc::deactivate_arena();
+    zk_alloc::end_phase();
 
     for p in ptrs {
         unsafe { ZK.dealloc(p, layout) };

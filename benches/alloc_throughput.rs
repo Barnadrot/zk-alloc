@@ -39,8 +39,7 @@ fn bench_large_alloc(c: &mut Criterion) {
 }
 
 fn bench_arena_bump(c: &mut Criterion) {
-    zk_alloc::phase_boundary(); // warmup
-    zk_alloc::phase_boundary(); // activate
+    zk_alloc::begin_phase();
     let layout = Layout::from_size_align(64, 8).unwrap();
     c.bench_function("arena_bump_64B", |b| {
         b.iter(|| unsafe {
@@ -48,7 +47,7 @@ fn bench_arena_bump(c: &mut Criterion) {
             std::hint::black_box(ptr);
         });
     });
-    zk_alloc::deactivate_arena();
+    zk_alloc::end_phase();
 }
 
 criterion_group!(
