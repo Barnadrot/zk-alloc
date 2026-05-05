@@ -103,8 +103,28 @@ pub fn begin_phase() {
 
 /// Deactivates the arena. New allocations go to the system allocator; existing arena
 /// pointers stay valid until the next `begin_phase()` resets the slabs.
+///
+/// With the `rayon-flush` feature (default), this also drains rayon's internal
+/// queues to release any crossbeam-deque blocks allocated during the phase.
 pub fn end_phase() {
     ARENA_ACTIVE.store(false, Ordering::Release);
+    #[cfg(feature = "rayon-flush")]
+    flush_rayon();
+}
+
+/// Drains rayon's crossbeam-deque injector to release blocks allocated during
+/// the active phase. Without this, `begin_phase()` would recycle memory that
+/// rayon's injector still references, causing silent corruption.
+///
+/// Pushes `FLUSH_JOBS` no-op joins. Each consumes one injector slot; once a
+/// block's last slot is consumed, crossbeam deallocates it. The fresh tail
+/// block lands in the system allocator (arena is already inactive).
+#[cfg(feature = "rayon-flush")]
+fn flush_rayon() {
+    const FLUSH_JOBS: usize = 256;
+    for _ in 0..FLUSH_JOBS {
+        rayon::join(|| {}, || {});
+    }
 }
 
 /// Returns (overflow_count, overflow_bytes) — allocations that fell through to System
