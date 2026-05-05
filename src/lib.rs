@@ -17,8 +17,8 @@
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Once;
 
 mod syscall;
 
