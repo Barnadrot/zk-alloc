@@ -359,6 +359,18 @@ unsafe impl GlobalAlloc for ZkAllocator {
         if new_size <= layout.size() {
             return ptr;
         }
+        // Sticky-System routing: if the original allocation came from System
+        // (small, or pre-phase, or routed by size-routing), keep the grown
+        // allocation in System too. Without this, a Vec allocated outside
+        // a phase that grows inside one would silently migrate into the
+        // arena and become subject to phase recycling.
+        let addr = ptr as usize;
+        let base = REGION_BASE.load(Ordering::Relaxed);
+        let region_size = REGION_SIZE.load(Ordering::Relaxed);
+        let in_arena = base != 0 && addr >= base && addr < base + region_size;
+        if !in_arena {
+            return unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        }
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
         let new_ptr = unsafe { self.alloc(new_layout) };
         if !new_ptr.is_null() {
