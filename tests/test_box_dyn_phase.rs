@@ -33,7 +33,10 @@ impl Witness for BigWitness {
         self.sentinel
     }
     fn payload_sum(&self) -> u64 {
-        self.payload.iter().sum::<u64>().wrapping_mul(self.multiplier)
+        self.payload
+            .iter()
+            .sum::<u64>()
+            .wrapping_mul(self.multiplier)
     }
 }
 

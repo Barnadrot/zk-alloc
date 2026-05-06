@@ -170,6 +170,53 @@ fn flush_rayon() {
     }
 }
 
+/// RAII guard for an arena phase. Calls `begin_phase()` on construction and
+/// `end_phase()` on drop — including during panic unwinding. Use this in
+/// place of paired `begin_phase()`/`end_phase()` calls when the phase body
+/// can panic, to avoid leaving the arena active across the unwind.
+///
+/// ```ignore
+/// loop {
+///     let _guard = zk_alloc::PhaseGuard::new();
+///     heavy_work_that_might_panic();
+///     // _guard drops here on normal return AND on unwind
+/// }
+/// ```
+pub struct PhaseGuard {
+    _private: (),
+}
+
+impl PhaseGuard {
+    /// Begins a phase. The phase ends when the returned guard is dropped.
+    pub fn new() -> Self {
+        begin_phase();
+        Self { _private: () }
+    }
+}
+
+impl Default for PhaseGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        end_phase();
+    }
+}
+
+/// Runs `f` inside a phase. Equivalent to constructing a `PhaseGuard`,
+/// running `f`, and dropping the guard. Panics in `f` propagate, but the
+/// phase is guaranteed to end before unwinding leaves this function.
+pub fn phase<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let _guard = PhaseGuard::new();
+    f()
+}
+
 /// Returns (overflow_count, overflow_bytes) — allocations that fell through to System
 /// because they exceeded the slab or arrived after all slabs were claimed.
 pub fn overflow_stats() -> (usize, usize) {
