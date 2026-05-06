@@ -138,6 +138,25 @@ fn ensure_region() -> usize {
 
 /// Activates the arena and resets every thread's slab. All allocations until the next
 /// `end_phase()` go to the arena; the previous phase's data is overwritten in place.
+///
+/// ## Retention is unsafe
+///
+/// Allocations made during phase N that are still held when phase N+1 begins
+/// are silently overwritten by phase N+1's first allocations at the same slab
+/// offset. Any of the following held across `begin_phase()` will be corrupted:
+///
+/// - `Vec<T>` with capacity ≥ [`min_arena_bytes()`] (`push` triggers `realloc`
+///   that copies from now-recycled source memory).
+/// - `Arc<T>` / `Rc<T>` with payload ≥ [`min_arena_bytes()`] (refcount fields
+///   become arbitrary bytes — silent leak or use-after-free).
+/// - `HashMap`, `BTreeMap`, etc. with bucket allocation ≥ [`min_arena_bytes()`]
+///   (lookup may infinite-loop on corrupted ctrl bytes).
+/// - `Box<dyn Trait>` with backing data ≥ [`min_arena_bytes()`] (vtable
+///   dispatch survives but field reads return filler bytes).
+///
+/// To preserve data across phases, `clone()` it into a System-backed copy
+/// (e.g., wrap in `Box::leak(Box::new(...))` while ARENA_ACTIVE is false,
+/// or copy into a `Vec` allocated outside any phase).
 pub fn begin_phase() {
     ensure_region();
     GENERATION.fetch_add(1, Ordering::Release);
