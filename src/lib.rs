@@ -1,21 +1,69 @@
 //! Bump-pointer arena allocator for ZK proving workloads.
 //!
-//! One mmap region split into per-thread slabs. Allocation = increment a thread-local
-//! pointer; free = no-op. `begin_phase()` resets the arena: each thread's next
-//! allocation starts over at the beginning of its slab, overwriting the previous
-//! phase's data. Allocations that don't fit (too large, or beyond max threads) fall
-//! back to the system allocator.
+//! # Two-allocator model
 //!
-//! Slab size defaults to 8GB per thread. Set `ZK_ALLOC_SLAB_GB` to override
-//! (e.g. `ZK_ALLOC_SLAB_GB=12` for large workloads). Use `overflow_stats()`
-//! to check if allocations spill to the system allocator.
+//! `ZkAllocator` is a façade over two allocators selected per call:
+//!
+//! - **Arena**: one `mmap` region split into per-thread slabs. Allocation
+//!   bumps a thread-local pointer; `dealloc` is a no-op. `begin_phase()`
+//!   resets every slab so the next phase reuses the same physical pages.
+//! - **System**: `std::alloc::System` (glibc on Linux). Used for everything
+//!   the arena shouldn't hold:
+//!   - any allocation when no phase is active;
+//!   - any allocation smaller than [`min_arena_bytes()`] even during a phase
+//!     (size-routing — keeps small library bookkeeping outside the arena);
+//!   - oversize allocations or threads that arrived after slabs were claimed
+//!     ([`overflow_stats()`] reports these);
+//!   - regrowth via `realloc` of a pointer that was already in System
+//!     (sticky-System routing — System allocations don't migrate to arena
+//!     on growth, even if the new size exceeds the size-routing threshold).
+//!
+//! # Phase scoping contract
+//!
+//! `begin_phase()` activates the arena and resets every slab. `end_phase()`
+//! deactivates the arena. Allocations made during phase N must not be held
+//! past `begin_phase()` of phase N+1: that call recycles the slab, and the
+//! next allocation at the same offset will silently overwrite the retained
+//! bytes.
+//!
+//! Practical rules:
+//!
+//! 1. Drop or `clone()` arena-allocated values before the phase ends.
+//! 2. Use [`PhaseGuard`] / [`phase`] to ensure `end_phase` runs even on
+//!    panic — without it, an unwinding phase leaves the arena active and
+//!    subsequent "post-phase" allocations land in arena territory.
+//! 3. Keep long-lived state (thread pools, channels, registries, caches)
+//!    constructed *outside* any active phase so it lives in System.
+//!
+//! # Realloc migration: prevented
+//!
+//! `realloc` checks whether the input pointer lies in the arena region.
+//! If it does, growth goes through the normal arena path (subject to
+//! size-routing). If it does not, growth stays in System via
+//! `System::realloc` — preventing the failure mode where a System-backed
+//! `Vec` silently migrates into the arena on `push`.
+//!
+//! # Configuration
+//!
+//! - `ZK_ALLOC_SLAB_GB` — per-thread slab size in GiB (default `8`).
+//! - `ZK_ALLOC_MIN_BYTES` — size-routing threshold in bytes (default `4096`).
+//!   Set to `0` to send every active-phase allocation to the arena.
+//! - `ZK_ALLOC_POISON_RESET` — diagnostic; set to `1` to `MADV_DONTNEED`
+//!   the previous phase's pages on reset (catches stale-pointer reads as
+//!   zero pages instead of last-phase data).
+//!
+//! # Example
 //!
 //! ```ignore
+//! use zk_alloc::ZkAllocator;
+//!
+//! #[global_allocator]
+//! static ALLOC: ZkAllocator = ZkAllocator;
+//!
 //! loop {
-//!     begin_phase();               // arena ON; slabs reset lazily
-//!     let res = heavy_work();      // fast bump increments
-//!     end_phase();                 // arena OFF; new allocations go to System
-//!     let copy = res.clone();      // detach from arena before next phase resets it
+//!     let proof = zk_alloc::phase(|| heavy_work()); // arena on inside
+//!     let output = proof.clone();                   // detach into System
+//!     submit(output);
 //! }
 //! ```
 
