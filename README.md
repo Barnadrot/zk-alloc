@@ -16,14 +16,50 @@ static ALLOC: ZkAllocator = ZkAllocator;
 
 fn main() {
     loop {
-        zk_alloc::begin_phase();             // activate arena, reset slabs
-        let proof = generate_proof();        // all allocs go to arena
-        zk_alloc::end_phase();               // deactivate arena
-        let output = proof.clone();          // clone out before next reset
+        let proof = zk_alloc::phase(|| generate_proof()); // arena on inside
+        let output = proof.clone();                       // detach to System
         submit(output);
     }
 }
 ```
+
+`phase(|| { ... })` activates the arena, runs the closure, and deactivates
+on return — including during panic unwinding (it's an RAII wrapper around
+`begin_phase()` / `end_phase()`, which are also exposed for callers that
+need finer-grained control).
+
+### Two-allocator model
+
+`ZkAllocator` routes each request to one of two backends:
+
+- **Arena** — bump-pointer slab, used during an active phase for allocations
+  ≥ `ZK_ALLOC_MIN_BYTES` (default 4096). Reset on the next `begin_phase()`.
+- **System** — `glibc malloc`, used for everything else: allocations made
+  outside any phase, allocations under the size-routing threshold (small
+  library bookkeeping like rayon's injector blocks, tracing-subscriber
+  registry slots, hashbrown HashMap entries), and `realloc` of any pointer
+  that originated in System (sticky-System routing — System allocations
+  never silently migrate to arena on growth).
+
+### Phase-scoping contract
+
+Allocations made during phase N must not be held past `begin_phase()` of
+phase N+1 — that call recycles the slab, and the next allocation at the
+same offset overwrites the retained bytes. In practice:
+
+1. Drop or `clone()` arena-allocated values before the phase ends.
+2. Construct long-lived state (thread pools, channels, registries) *before*
+   any phase begins so it lives in System.
+3. Use `phase(|| { ... })` (or a `PhaseGuard`) instead of paired calls so
+   the phase ends correctly even on panic.
+
+### Environment variables
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `ZK_ALLOC_SLAB_GB` | `8` | Per-thread slab size, in GiB. Raise for workloads that overflow (`overflow_stats()` reports the count). |
+| `ZK_ALLOC_MIN_BYTES` | `4096` | Size-routing threshold. Allocations smaller than this go to System even during a phase. Set to `0` to send everything to arena (loses size-routing protection against library-internal pooled allocations). |
+| `ZK_ALLOC_POISON_RESET` | unset | Diagnostic. Set to `1` to `MADV_DONTNEED` the previous phase's pages on reset, so any stale-pointer read returns zero pages instead of last-phase data. |
 
 ## Results
 
