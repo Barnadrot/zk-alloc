@@ -10,9 +10,13 @@
 //! Worker still references the same Buffer pointer. The next push writes
 //! a JobRef into recycled memory.
 //!
-//! Tests: drive deep rayon::join recursion from inside a worker (so pushes
+//! Tests: drive rayon::join recursion from inside a worker (so pushes
 //! land on a worker's local deque, not the global Injector) to force Buffer
 //! growth past the size-routing threshold, then look for canary corruption.
+//!
+//! Recursion depth is capped at 256 to stay within macOS's smaller default
+//! thread stack in debug builds; 256 pending tasks already drives the
+//! Buffer to the 256-slot capacity that crosses MIN_ARENA_BYTES=4096.
 
 use rayon::prelude::*;
 
@@ -33,7 +37,7 @@ fn worker_deque_growth_during_phase() {
     let _: u64 = (0..1_000_000_u64).into_par_iter().sum();
 
     const CYCLES: usize = 20;
-    const DEPTH: usize = 1024; // > 256 → forces Buffer growth past 4 KB
+    const DEPTH: usize = 256; // crosses Buffer growth into arena (~4 KB)
 
     let mut failures = 0;
     for cycle in 0..CYCLES {
@@ -76,7 +80,7 @@ fn deep_recursion_phase_cycle_program_integrity() {
 
     for _ in 0..50 {
         zk_alloc::begin_phase();
-        rayon::join(|| nested_join(2048), || {});
+        rayon::join(|| nested_join(256), || {});
         zk_alloc::end_phase();
     }
 }
@@ -103,7 +107,7 @@ fn worker_buffer_growth_with_per_worker_canary() {
     const CYCLES: usize = 20;
     for cycle in 0..CYCLES {
         zk_alloc::begin_phase();
-        rayon::join(|| nested_join_with_alloc(512), || {});
+        rayon::join(|| nested_join_with_alloc(256), || {});
         zk_alloc::end_phase();
 
         zk_alloc::begin_phase();
