@@ -2,12 +2,19 @@
 //! impossible by construction. Drop runs during unwind, calling end_phase.
 //!
 //! Mirrors test_panic_phase but uses the RAII API. Asserts NO corruption.
+//!
+//! All three tests in this binary touch the global ARENA_ACTIVE / bump
+//! pointer state, so they must not run concurrently — the panic-handler
+//! hook is also process-global. Serialize via a file-local mutex.
+
+static PHASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[global_allocator]
 static A: zk_alloc::ZkAllocator = zk_alloc::ZkAllocator;
 
 #[test]
 fn phase_guard_runs_end_phase_on_panic() {
+    let _lock = PHASE_LOCK.lock().unwrap();
     use std::panic;
 
     panic::set_hook(Box::new(|_| {}));
@@ -58,6 +65,7 @@ fn phase_guard_runs_end_phase_on_panic() {
 
 #[test]
 fn phase_guard_runs_end_phase_on_normal_return() {
+    let _lock = PHASE_LOCK.lock().unwrap();
     let v = zk_alloc::phase(|| vec![0xAB_u8; 8192]);
     // After phase, arena is inactive. Subsequent allocations go to System.
     let after: Vec<u8> = vec![0xCD_u8; 8192];
@@ -79,6 +87,7 @@ fn phase_guard_runs_end_phase_on_normal_return() {
 
 #[test]
 fn nested_phase_guards_compose() {
+    let _lock = PHASE_LOCK.lock().unwrap();
     // Outer phase + inner phase. Inner phase end_phases (sets active=false),
     // then outer phase end_phases again. Sequence: begin, begin, end, end.
     // Final state: active=false. No panic.
