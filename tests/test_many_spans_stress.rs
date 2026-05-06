@@ -7,7 +7,7 @@
 
 use rayon::prelude::*;
 use tracing::info_span;
-use tracing_subscriber::{Registry, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Registry};
 
 #[global_allocator]
 static A: zk_alloc::ZkAllocator = zk_alloc::ZkAllocator;

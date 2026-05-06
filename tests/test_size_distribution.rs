@@ -35,12 +35,10 @@ fn profile_allocation_sizes_in_phase() {
         let large: Vec<Vec<u8>> = (0..10).map(|_| vec![0_u8; 1 << 20]).collect();
         std::hint::black_box((&tiny, &small, &medium, &large));
         tiny.clear();
-        SIZES.lock().unwrap().extend([
-            tiny.capacity(),
-            small.len(),
-            medium.len(),
-            large.len(),
-        ]);
+        SIZES
+            .lock()
+            .unwrap()
+            .extend([tiny.capacity(), small.len(), medium.len(), large.len()]);
     }
 
     zk_alloc::end_phase();

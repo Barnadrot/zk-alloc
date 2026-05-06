@@ -19,20 +19,26 @@ fn phase_boundary_during_par_iter() {
     zk_alloc::begin_phase();
 
     // Workers each allocate a vec, sum it. Force them to allocate in arena.
-    let result: u64 = (0..16_u64).into_par_iter().map(|i| {
-        let v: Vec<u64> = (0..(1 << 14)).map(|j| j ^ i).collect();
-        v.iter().sum::<u64>()
-    }).sum();
+    let result: u64 = (0..16_u64)
+        .into_par_iter()
+        .map(|i| {
+            let v: Vec<u64> = (0..(1 << 14)).map(|j| j ^ i).collect();
+            v.iter().sum::<u64>()
+        })
+        .sum();
     std::hint::black_box(result);
 
     zk_alloc::end_phase();
 
     zk_alloc::begin_phase();
     let canary = vec![0xC9_u8; 8 << 20];
-    let _: u64 = (0..16_u64).into_par_iter().map(|i| {
-        let v: Vec<u64> = (0..(1 << 14)).map(|j| j ^ i).collect();
-        v.iter().sum::<u64>()
-    }).sum();
+    let _: u64 = (0..16_u64)
+        .into_par_iter()
+        .map(|i| {
+            let v: Vec<u64> = (0..(1 << 14)).map(|j| j ^ i).collect();
+            v.iter().sum::<u64>()
+        })
+        .sum();
     zk_alloc::end_phase();
 
     let pos = canary.iter().position(|&b| b != 0xC9);
@@ -51,10 +57,13 @@ fn many_par_iter_phase_cycles() {
 
     for _ in 0..100 {
         zk_alloc::begin_phase();
-        let sum: u64 = (0..256_u64).into_par_iter().map(|i| {
-            let v: Vec<u64> = (0..(1 << 12)).map(|j| j ^ i).collect();
-            v.iter().sum::<u64>()
-        }).sum();
+        let sum: u64 = (0..256_u64)
+            .into_par_iter()
+            .map(|i| {
+                let v: Vec<u64> = (0..(1 << 12)).map(|j| j ^ i).collect();
+                v.iter().sum::<u64>()
+            })
+            .sum();
         std::hint::black_box(sum);
         zk_alloc::end_phase();
     }
