@@ -6,6 +6,10 @@
 //! phase's data. Allocations that don't fit (too large, or beyond max threads) fall
 //! back to the system allocator.
 //!
+//! Slab size defaults to 8GB per thread. Set `ZK_ALLOC_SLAB_GB` to override
+//! (e.g. `ZK_ALLOC_SLAB_GB=12` for large workloads). Use `overflow_stats()`
+//! to check if allocations spill to the system allocator.
+//!
 //! ```ignore
 //! loop {
 //!     begin_phase();               // arena ON; slabs reset lazily
@@ -22,11 +26,15 @@ use std::sync::Once;
 
 mod syscall;
 
-const SLAB_SIZE: usize = 8 << 30; // 8GB
+const DEFAULT_SLAB_GB: usize = 8;
 const SLACK: usize = 4;
 
 #[derive(Debug)]
 pub struct ZkAllocator;
+
+/// Per-thread slab size in bytes. Set once during `ensure_region()` from the
+/// `ZK_ALLOC_SLAB_GB` environment variable (default: 8).
+static SLAB_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 /// Incremented by `begin_phase()`. Every thread caches the last value it saw in
 /// `ARENA_GEN`; when they differ, the thread resets its allocation cursor to the start
@@ -59,6 +67,24 @@ static MAX_THREADS: AtomicUsize = AtomicUsize::new(0);
 static OVERFLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static OVERFLOW_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Diagnostic mode: when true, begin_phase forcibly drops the previous phase's
+/// pages via MADV_DONTNEED so any stale arena pointer reads zero instead of
+/// last-phase data. Set via ZK_ALLOC_POISON_RESET=1 env var.
+static POISON_RESET: AtomicBool = AtomicBool::new(false);
+
+/// Allocations smaller than this go to System even during active phases.
+/// Routes registry / hashmap / injector-block-sized allocations away from
+/// the arena, so library state that outlives a phase doesn't land in
+/// recycled memory.
+///
+/// Defaults to 4096 (one page) — covers the known phase-crossing patterns:
+/// crossbeam_deque::Injector blocks (~1.5 KB), tracing-subscriber Registry
+/// slot data (sub-KB), hashbrown HashMap entries (sub-KB), rayon-core job
+/// stack frames (sub-KB). Set ZK_ALLOC_MIN_BYTES=0 to disable, or override
+/// to a different threshold.
+const DEFAULT_MIN_ARENA_BYTES: usize = 4096;
+static MIN_ARENA_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MIN_ARENA_BYTES);
+
 thread_local! {
     /// Where this thread's next allocation lands. Advanced past each allocation.
     static ARENA_PTR: Cell<usize> = const { Cell::new(0) };
@@ -74,11 +100,27 @@ thread_local! {
 
 fn ensure_region() -> usize {
     REGION_INIT.call_once(|| {
+        let slab_gb = std::env::var("ZK_ALLOC_SLAB_GB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SLAB_GB);
+        let slab_size = slab_gb << 30;
+        SLAB_SIZE.store(slab_size, Ordering::Release);
+
+        if std::env::var("ZK_ALLOC_POISON_RESET").as_deref() == Ok("1") {
+            POISON_RESET.store(true, Ordering::Release);
+        }
+        if let Ok(s) = std::env::var("ZK_ALLOC_MIN_BYTES") {
+            if let Ok(n) = s.parse::<usize>() {
+                MIN_ARENA_BYTES.store(n, Ordering::Release);
+            }
+        }
+
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
         let max_threads = cpus + SLACK;
-        let region_size = SLAB_SIZE * max_threads;
+        let region_size = slab_size * max_threads;
 
         // SAFETY: mmap_anonymous returns a page-aligned pointer or null.
         // MAP_NORESERVE means no physical memory is committed until pages are touched.
@@ -97,6 +139,7 @@ fn ensure_region() -> usize {
 /// Activates the arena and resets every thread's slab. All allocations until the next
 /// `end_phase()` go to the arena; the previous phase's data is overwritten in place.
 pub fn begin_phase() {
+    ensure_region();
     GENERATION.fetch_add(1, Ordering::Release);
     ARENA_ACTIVE.store(true, Ordering::Release);
 }
@@ -141,6 +184,17 @@ pub fn reset_overflow_stats() {
     OVERFLOW_BYTES.store(0, Ordering::Relaxed);
 }
 
+/// Returns the per-thread slab size in bytes. Zero before the first `begin_phase()`.
+pub fn slab_size() -> usize {
+    SLAB_SIZE.load(Ordering::Relaxed)
+}
+
+/// Returns the minimum allocation size routed through the arena. Allocations
+/// smaller than this go to System even during active phases.
+pub fn min_arena_bytes() -> usize {
+    MIN_ARENA_BYTES.load(Ordering::Relaxed)
+}
+
 #[cold]
 #[inline(never)]
 unsafe fn arena_alloc_cold(size: usize, align: usize) -> *mut u8 {
@@ -157,9 +211,25 @@ unsafe fn arena_alloc_cold(size: usize, align: usize) -> *mut u8 {
                     std::alloc::System.alloc(Layout::from_size_align_unchecked(size, align))
                 };
             }
-            base = region + idx * SLAB_SIZE;
+            let slab_size = SLAB_SIZE.load(Ordering::Relaxed);
+            base = region + idx * slab_size;
             ARENA_BASE.set(base);
-            ARENA_END.set(base + SLAB_SIZE);
+            ARENA_END.set(base + slab_size);
+        }
+        // Diagnostic: MADV_DONTNEED on previous phase's used range to force
+        // any stale references to read fresh zero pages instead of the
+        // last-phase data. Behind ZK_ALLOC_POISON_RESET=1 to keep prod fast.
+        if POISON_RESET.load(Ordering::Relaxed) {
+            let prev_ptr = ARENA_PTR.get();
+            if prev_ptr > base {
+                let len = prev_ptr - base;
+                let page_aligned_len = len & !0xFFF;
+                if page_aligned_len > 0 {
+                    unsafe {
+                        syscall::madvise(base as *mut u8, page_aligned_len, syscall::MADV_DONTNEED)
+                    };
+                }
+            }
         }
         ARENA_PTR.set(base);
         ARENA_GEN.set(generation);
@@ -184,6 +254,14 @@ unsafe impl GlobalAlloc for ZkAllocator {
     #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARENA_ACTIVE.load(Ordering::Relaxed) {
+            // Small allocs bypass arena: registry slots / HashMap entries /
+            // injector-block-sized allocations from rayon/tracing libraries
+            // commonly outlive a phase. Routing them to System keeps them
+            // safe across begin_phase()/end_phase() boundaries.
+            let min_bytes = MIN_ARENA_BYTES.load(Ordering::Relaxed);
+            if min_bytes != 0 && layout.size() < min_bytes {
+                return unsafe { std::alloc::System.alloc(layout) };
+            }
             let generation = GENERATION.load(Ordering::Relaxed);
             if ARENA_GEN.get() == generation {
                 let ptr = ARENA_PTR.get();
