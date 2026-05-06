@@ -2,10 +2,20 @@
 name = "zk-alloc"
 version = "0.1.0"
 edition = "2021"
-description = "A memory allocator designed for ZK proving workloads"
+rust-version = "1.73"
+description = "Bump+reset arena allocator for ZK proving workloads"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Barnadrot/zk-alloc"
+readme = "README.md"
+keywords = ["allocator", "arena", "zk", "proving", "memory"]
+categories = ["memory-management", "no-std"]
+
+[features]
+default = ["rayon-flush"]
+rayon-flush = ["rayon"]
 
 [dependencies]
+rayon = { version = "1.10", optional = true }
 
 [target.'cfg(not(all(target_os = "linux", target_arch = "x86_64")))'.dependencies]
 libc = "0.2"
