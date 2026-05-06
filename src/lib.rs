@@ -423,7 +423,16 @@ unsafe impl GlobalAlloc for ZkAllocator {
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
         let new_ptr = unsafe { self.alloc(new_layout) };
         if !new_ptr.is_null() {
-            unsafe { std::ptr::copy_nonoverlapping(ptr, new_ptr, layout.size()) };
+            // Use `ptr::copy` (memmove) instead of `copy_nonoverlapping`:
+            // when reallocating an arena pointer across a phase boundary,
+            // the cold-path slab reset (or fast-path bump after reset) can
+            // hand back a pointer that aliases or partially overlaps the
+            // source. `copy_nonoverlapping` is UB on overlap; `copy`
+            // handles it correctly. Modern x86_64 memcpy implementations
+            // happen to be safe for short overlaps in practice, but the
+            // language-level UB is real and would surface under miri or
+            // future codegen.
+            unsafe { std::ptr::copy(ptr, new_ptr, layout.size()) };
             unsafe { self.dealloc(ptr, layout) };
         }
         new_ptr

@@ -58,7 +58,7 @@ fn realloc_partial_overlap_preserves_source_bytes() {
     let p2 = unsafe { ZK.realloc(p1, layout1, 16384) };
     assert!(!p2.is_null(), "realloc returned null");
 
-    eprintln!(
+    println!(
         "p1=0x{:x} py=0x{:x} p2=0x{:x}",
         p1 as usize, py as usize, p2 as usize
     );
