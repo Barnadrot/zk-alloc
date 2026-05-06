@@ -44,8 +44,8 @@ fn panic_without_phase_guard_orphans_phase_depth() {
     let _ = panic::take_hook();
 
     let post_in_big = post_panic_ptr >= big_ptr && post_panic_ptr < big_end;
-    let big_overlaps_post = big_ptr < post_panic_ptr + post_panic.len()
-        && big_ptr + big.len() > post_panic_ptr;
+    let big_overlaps_post =
+        big_ptr < post_panic_ptr + post_panic.len() && big_ptr + big.len() > post_panic_ptr;
     let observed = post_panic[0];
 
     eprintln!(
