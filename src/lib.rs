@@ -1,17 +1,66 @@
 //! Bump-pointer arena allocator for ZK proving workloads.
 //!
-//! One mmap region split into per-thread slabs. Allocation = increment a thread-local
-//! pointer; free = no-op. `begin_phase()` resets the arena: each thread's next
-//! allocation starts over at the beginning of its slab, overwriting the previous
-//! phase's data. Allocations that don't fit (too large, or beyond max threads) fall
-//! back to the system allocator.
+//! # Two-allocator model
+//!
+//! `ZkAllocator` is a façade over two allocators selected per call:
+//!
+//! - **Arena**: one `mmap` region split into per-thread slabs. Allocation
+//!   bumps a thread-local pointer; `dealloc` is a no-op. `begin_phase()`
+//!   resets every slab so the next phase reuses the same physical pages.
+//! - **System**: `std::alloc::System` (glibc on Linux). Used for everything
+//!   the arena shouldn't hold:
+//!   - any allocation when no phase is active;
+//!   - any allocation smaller than [`min_arena_bytes()`] even during a phase
+//!     (size-routing — keeps small library bookkeeping outside the arena);
+//!   - oversize allocations or threads that arrived after slabs were claimed
+//!     ([`overflow_stats()`] reports these);
+//!   - regrowth via `realloc` of a pointer that was already in System
+//!     (sticky-System routing — System allocations don't migrate to arena
+//!     on growth, even if the new size exceeds the size-routing threshold).
+//!
+//! # Phase scoping contract
+//!
+//! `begin_phase()` activates the arena and resets every slab. `end_phase()`
+//! deactivates the arena. Allocations made during phase N must not be held
+//! past `begin_phase()` of phase N+1: that call recycles the slab, and the
+//! next allocation at the same offset will silently overwrite the retained
+//! bytes.
+//!
+//! Practical rules:
+//!
+//! 1. Drop or `clone()` arena-allocated values before the phase ends.
+//! 2. Use [`PhaseGuard`] / [`phase`] to ensure `end_phase` runs even on
+//!    panic — without it, an unwinding phase leaves the arena active and
+//!    subsequent "post-phase" allocations land in arena territory.
+//! 3. Keep long-lived state (thread pools, channels, registries, caches)
+//!    constructed *outside* any active phase so it lives in System.
+//!
+//! # Realloc migration: prevented
+//!
+//! `realloc` checks whether the input pointer lies in the arena region.
+//! If it does, growth goes through the normal arena path (subject to
+//! size-routing). If it does not, growth stays in System via
+//! `System::realloc` — preventing the failure mode where a System-backed
+//! `Vec` silently migrates into the arena on `push`.
+//!
+//! # Configuration
+//!
+//! - `ZK_ALLOC_SLAB_GB` — per-thread slab size in GiB (default `8`).
+//! - `ZK_ALLOC_MIN_BYTES` — size-routing threshold in bytes (default `4096`).
+//!   Set to `0` to send every active-phase allocation to the arena.
+//!
+//! # Example
 //!
 //! ```ignore
+//! use zk_alloc::ZkAllocator;
+//!
+//! #[global_allocator]
+//! static ALLOC: ZkAllocator = ZkAllocator;
+//!
 //! loop {
-//!     begin_phase();               // arena ON; slabs reset lazily
-//!     let res = heavy_work();      // fast bump increments
-//!     end_phase();                 // arena OFF; new allocations go to System
-//!     let copy = res.clone();      // detach from arena before next phase resets it
+//!     let proof = zk_alloc::phase(|| heavy_work()); // arena on inside
+//!     let output = proof.clone();                   // detach into System
+//!     submit(output);
 //! }
 //! ```
 
@@ -22,11 +71,15 @@ use std::sync::Once;
 
 mod syscall;
 
-const SLAB_SIZE: usize = 8 << 30; // 8GB
+const DEFAULT_SLAB_GB: usize = 8;
 const SLACK: usize = 4;
 
 #[derive(Debug)]
 pub struct ZkAllocator;
+
+/// Per-thread slab size in bytes. Set once during `ensure_region()` from the
+/// `ZK_ALLOC_SLAB_GB` environment variable (default: 8).
+static SLAB_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 /// Incremented by `begin_phase()`. Every thread caches the last value it saw in
 /// `ARENA_GEN`; when they differ, the thread resets its allocation cursor to the start
@@ -59,6 +112,19 @@ static MAX_THREADS: AtomicUsize = AtomicUsize::new(0);
 static OVERFLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static OVERFLOW_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Allocations smaller than this go to System even during active phases.
+/// Routes registry / hashmap / injector-block-sized allocations away from
+/// the arena, so library state that outlives a phase doesn't land in
+/// recycled memory.
+///
+/// Defaults to 4096 (one page) — covers the known phase-crossing patterns:
+/// crossbeam_deque::Injector blocks (~1.5 KB), tracing-subscriber Registry
+/// slot data (sub-KB), hashbrown HashMap entries (sub-KB), rayon-core job
+/// stack frames (sub-KB). Set ZK_ALLOC_MIN_BYTES=0 to disable, or override
+/// to a different threshold.
+const DEFAULT_MIN_ARENA_BYTES: usize = 4096;
+static MIN_ARENA_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MIN_ARENA_BYTES);
+
 thread_local! {
     /// Where this thread's next allocation lands. Advanced past each allocation.
     static ARENA_PTR: Cell<usize> = const { Cell::new(0) };
@@ -74,11 +140,24 @@ thread_local! {
 
 fn ensure_region() -> usize {
     REGION_INIT.call_once(|| {
+        let slab_gb = std::env::var("ZK_ALLOC_SLAB_GB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SLAB_GB);
+        let slab_size = slab_gb << 30;
+        SLAB_SIZE.store(slab_size, Ordering::Release);
+
+        if let Ok(s) = std::env::var("ZK_ALLOC_MIN_BYTES") {
+            if let Ok(n) = s.parse::<usize>() {
+                MIN_ARENA_BYTES.store(n, Ordering::Release);
+            }
+        }
+
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
         let max_threads = cpus + SLACK;
-        let region_size = SLAB_SIZE * max_threads;
+        let region_size = slab_size * max_threads;
 
         // SAFETY: mmap_anonymous returns a page-aligned pointer or null.
         // MAP_NORESERVE means no physical memory is committed until pages are touched.
@@ -96,7 +175,27 @@ fn ensure_region() -> usize {
 
 /// Activates the arena and resets every thread's slab. All allocations until the next
 /// `end_phase()` go to the arena; the previous phase's data is overwritten in place.
+///
+/// ## Retention is unsafe
+///
+/// Allocations made during phase N that are still held when phase N+1 begins
+/// are silently overwritten by phase N+1's first allocations at the same slab
+/// offset. Any of the following held across `begin_phase()` will be corrupted:
+///
+/// - `Vec<T>` with capacity ≥ [`min_arena_bytes()`] (`push` triggers `realloc`
+///   that copies from now-recycled source memory).
+/// - `Arc<T>` / `Rc<T>` with payload ≥ [`min_arena_bytes()`] (refcount fields
+///   become arbitrary bytes — silent leak or use-after-free).
+/// - `HashMap`, `BTreeMap`, etc. with bucket allocation ≥ [`min_arena_bytes()`]
+///   (lookup may infinite-loop on corrupted ctrl bytes).
+/// - `Box<dyn Trait>` with backing data ≥ [`min_arena_bytes()`] (vtable
+///   dispatch survives but field reads return filler bytes).
+///
+/// To preserve data across phases, `clone()` it into a System-backed copy
+/// (e.g., wrap in `Box::leak(Box::new(...))` while ARENA_ACTIVE is false,
+/// or copy into a `Vec` allocated outside any phase).
 pub fn begin_phase() {
+    ensure_region();
     GENERATION.fetch_add(1, Ordering::Release);
     ARENA_ACTIVE.store(true, Ordering::Release);
 }
@@ -127,6 +226,53 @@ fn flush_rayon() {
     }
 }
 
+/// RAII guard for an arena phase. Calls `begin_phase()` on construction and
+/// `end_phase()` on drop — including during panic unwinding. Use this in
+/// place of paired `begin_phase()`/`end_phase()` calls when the phase body
+/// can panic, to avoid leaving the arena active across the unwind.
+///
+/// ```ignore
+/// loop {
+///     let _guard = zk_alloc::PhaseGuard::new();
+///     heavy_work_that_might_panic();
+///     // _guard drops here on normal return AND on unwind
+/// }
+/// ```
+pub struct PhaseGuard {
+    _private: (),
+}
+
+impl PhaseGuard {
+    /// Begins a phase. The phase ends when the returned guard is dropped.
+    pub fn new() -> Self {
+        begin_phase();
+        Self { _private: () }
+    }
+}
+
+impl Default for PhaseGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        end_phase();
+    }
+}
+
+/// Runs `f` inside a phase. Equivalent to constructing a `PhaseGuard`,
+/// running `f`, and dropping the guard. Panics in `f` propagate, but the
+/// phase is guaranteed to end before unwinding leaves this function.
+pub fn phase<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let _guard = PhaseGuard::new();
+    f()
+}
+
 /// Returns (overflow_count, overflow_bytes) — allocations that fell through to System
 /// because they exceeded the slab or arrived after all slabs were claimed.
 pub fn overflow_stats() -> (usize, usize) {
@@ -139,6 +285,17 @@ pub fn overflow_stats() -> (usize, usize) {
 pub fn reset_overflow_stats() {
     OVERFLOW_COUNT.store(0, Ordering::Relaxed);
     OVERFLOW_BYTES.store(0, Ordering::Relaxed);
+}
+
+/// Returns the per-thread slab size in bytes. Zero before the first `begin_phase()`.
+pub fn slab_size() -> usize {
+    SLAB_SIZE.load(Ordering::Relaxed)
+}
+
+/// Returns the minimum allocation size routed through the arena. Allocations
+/// smaller than this go to System even during active phases.
+pub fn min_arena_bytes() -> usize {
+    MIN_ARENA_BYTES.load(Ordering::Relaxed)
 }
 
 #[cold]
@@ -157,9 +314,10 @@ unsafe fn arena_alloc_cold(size: usize, align: usize) -> *mut u8 {
                     std::alloc::System.alloc(Layout::from_size_align_unchecked(size, align))
                 };
             }
-            base = region + idx * SLAB_SIZE;
+            let slab_size = SLAB_SIZE.load(Ordering::Relaxed);
+            base = region + idx * slab_size;
             ARENA_BASE.set(base);
-            ARENA_END.set(base + SLAB_SIZE);
+            ARENA_END.set(base + slab_size);
         }
         ARENA_PTR.set(base);
         ARENA_GEN.set(generation);
@@ -184,6 +342,14 @@ unsafe impl GlobalAlloc for ZkAllocator {
     #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARENA_ACTIVE.load(Ordering::Relaxed) {
+            // Small allocs bypass arena: registry slots / HashMap entries /
+            // injector-block-sized allocations from rayon/tracing libraries
+            // commonly outlive a phase. Routing them to System keeps them
+            // safe across begin_phase()/end_phase() boundaries.
+            let min_bytes = MIN_ARENA_BYTES.load(Ordering::Relaxed);
+            if min_bytes != 0 && layout.size() < min_bytes {
+                return unsafe { std::alloc::System.alloc(layout) };
+            }
             let generation = GENERATION.load(Ordering::Relaxed);
             if ARENA_GEN.get() == generation {
                 let ptr = ARENA_PTR.get();
@@ -214,6 +380,18 @@ unsafe impl GlobalAlloc for ZkAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if new_size <= layout.size() {
             return ptr;
+        }
+        // Sticky-System routing: if the original allocation came from System
+        // (small, or pre-phase, or routed by size-routing), keep the grown
+        // allocation in System too. Without this, a Vec allocated outside
+        // a phase that grows inside one would silently migrate into the
+        // arena and become subject to phase recycling.
+        let addr = ptr as usize;
+        let base = REGION_BASE.load(Ordering::Relaxed);
+        let region_size = REGION_SIZE.load(Ordering::Relaxed);
+        let in_arena = base != 0 && addr >= base && addr < base + region_size;
+        if !in_arena {
+            return unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
         }
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
         let new_ptr = unsafe { self.alloc(new_layout) };
