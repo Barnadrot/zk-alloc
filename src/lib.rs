@@ -112,6 +112,13 @@ static MAX_THREADS: AtomicUsize = AtomicUsize::new(0);
 static OVERFLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static OVERFLOW_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Nested-phase counter. `begin_phase()` increments it; `end_phase()`
+/// decrements. Only the outermost begin (0 → 1) bumps GENERATION and
+/// flips ARENA_ACTIVE; only the outermost end (1 → 0) deactivates.
+/// This makes nested `begin_phase()` calls compose without the inner
+/// begin recycling the outer phase's slab data.
+static PHASE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
 /// Allocations smaller than this go to System even during active phases.
 /// Routes registry / hashmap / injector-block-sized allocations away from
 /// the arena, so library state that outlives a phase doesn't land in
@@ -196,8 +203,14 @@ fn ensure_region() -> usize {
 /// or copy into a `Vec` allocated outside any phase).
 pub fn begin_phase() {
     ensure_region();
-    GENERATION.fetch_add(1, Ordering::Release);
-    ARENA_ACTIVE.store(true, Ordering::Release);
+    // Only the outermost begin bumps GENERATION and activates the arena.
+    // Nested begin_phase() calls just bump the depth counter; without this
+    // guard, an inner begin would recycle the slab and silently overwrite
+    // the outer phase's bump-allocated data.
+    if PHASE_DEPTH.fetch_add(1, Ordering::AcqRel) == 0 {
+        GENERATION.fetch_add(1, Ordering::Release);
+        ARENA_ACTIVE.store(true, Ordering::Release);
+    }
 }
 
 /// Deactivates the arena. New allocations go to the system allocator; existing arena
@@ -205,10 +218,24 @@ pub fn begin_phase() {
 ///
 /// With the `rayon-flush` feature (default), this also drains rayon's internal
 /// queues to release any crossbeam-deque blocks allocated during the phase.
+///
+/// Calls beyond the matching `begin_phase()` (i.e., when no phase is
+/// active) are tolerated and have no effect.
 pub fn end_phase() {
-    ARENA_ACTIVE.store(false, Ordering::Release);
-    #[cfg(feature = "rayon-flush")]
-    flush_rayon();
+    // Only the outermost end (depth 1 → 0) tears down. Saturate at zero so
+    // unbalanced end_phase() calls are no-ops rather than wrapping around.
+    let prev = PHASE_DEPTH.fetch_update(Ordering::AcqRel, Ordering::Acquire, |d| {
+        if d == 0 {
+            None
+        } else {
+            Some(d - 1)
+        }
+    });
+    if let Ok(1) = prev {
+        ARENA_ACTIVE.store(false, Ordering::Release);
+        #[cfg(feature = "rayon-flush")]
+        flush_rayon();
+    }
 }
 
 /// Drains rayon's crossbeam-deque injector to release blocks allocated during
@@ -396,7 +423,16 @@ unsafe impl GlobalAlloc for ZkAllocator {
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
         let new_ptr = unsafe { self.alloc(new_layout) };
         if !new_ptr.is_null() {
-            unsafe { std::ptr::copy_nonoverlapping(ptr, new_ptr, layout.size()) };
+            // Use `ptr::copy` (memmove) instead of `copy_nonoverlapping`:
+            // when reallocating an arena pointer across a phase boundary,
+            // the cold-path slab reset (or fast-path bump after reset) can
+            // hand back a pointer that aliases or partially overlaps the
+            // source. `copy_nonoverlapping` is UB on overlap; `copy`
+            // handles it correctly. Modern x86_64 memcpy implementations
+            // happen to be safe for short overlaps in practice, but the
+            // language-level UB is real and would surface under miri or
+            // future codegen.
+            unsafe { std::ptr::copy(ptr, new_ptr, layout.size()) };
             unsafe { self.dealloc(ptr, layout) };
         }
         new_ptr
