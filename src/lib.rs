@@ -117,11 +117,22 @@ static OVERFLOW_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// the arena, so library state that outlives a phase doesn't land in
 /// recycled memory.
 ///
-/// Defaults to 4096 (one page) — covers the known phase-crossing patterns:
-/// crossbeam_deque::Injector blocks (~1.5 KB), tracing-subscriber Registry
-/// slot data (sub-KB), hashbrown HashMap entries (sub-KB), rayon-core job
-/// stack frames (sub-KB). Set ZK_ALLOC_MIN_BYTES=0 to disable, or override
+/// Defaults to 4096 (one page) on x86_64 — covers the known phase-crossing
+/// patterns: crossbeam_deque::Injector blocks (~1.5 KB), tracing-subscriber
+/// Registry slot data (sub-KB), hashbrown HashMap entries (sub-KB), rayon-core
+/// job stack frames (sub-KB). Set ZK_ALLOC_MIN_BYTES=0 to disable, or override
 /// to a different threshold.
+///
+/// On aarch64 the default drops to 256: with the iter-8 32 MiB-THP-backed
+/// arena, allocs in the arena hit a hugepage TLB entry while System allocs
+/// land on 16 KiB base pages, so routing the 256..4095 size band into the
+/// arena buys the hugepage TLB benefit for those allocations (-1.30% of
+/// cycles in glibc helpers observed on the original zk-alloc M2 profile).
+/// The rayon-flush feature (default-on) keeps Injector blocks safe across
+/// phase boundaries; sticky-System realloc protects grown Vecs.
+#[cfg(target_arch = "aarch64")]
+const DEFAULT_MIN_ARENA_BYTES: usize = 256;
+#[cfg(not(target_arch = "aarch64"))]
 const DEFAULT_MIN_ARENA_BYTES: usize = 4096;
 static MIN_ARENA_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MIN_ARENA_BYTES);
 
