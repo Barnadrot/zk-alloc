@@ -96,6 +96,7 @@ mod imp {
 mod imp {
     use std::ptr;
 
+    pub const MADV_HUGEPAGE: usize = 14;
     pub const MADV_NOHUGEPAGE: usize = 15;
 
     #[inline]
@@ -117,6 +118,18 @@ mod imp {
     pub unsafe fn madvise(_ptr: *mut u8, _size: usize, _advice: usize) {
         // The advice values we pass are Linux-specific.
     }
+
+    /// Conservative stub: returns 0 to signal "unknown". Real allocation-free
+    /// implementations (sysinfo syscall on aarch64-Linux, sysctl on macOS) live
+    /// behind their own raw-syscall imp blocks. With 0, the lib.rs adaptive
+    /// pre-touch falls back to a single hugepage per slab — safe (no OOM)
+    /// but loses the full THP-coverage win of iter 8.
+    #[inline]
+    pub unsafe fn total_ram_bytes() -> usize {
+        0
+    }
 }
 
 pub use imp::{madvise, mmap_anonymous, MADV_NOHUGEPAGE};
+#[cfg(target_arch = "aarch64")]
+pub use imp::{total_ram_bytes, MADV_HUGEPAGE};

@@ -159,16 +159,81 @@ fn ensure_region() -> usize {
         let max_threads = cpus + SLACK;
         let region_size = slab_size * max_threads;
 
+        // On aarch64 Linux (M2/Asahi) THP page size is 32 MiB. Over-allocate by
+        // THP_SIZE so we can round REGION_BASE up to a 32 MiB boundary — required
+        // for khugepaged to collapse base pages into hugepages. Without alignment
+        // + an eager touch (one write per 32 MiB) the kernel collapses the touched
+        // region into THP synchronously instead of relying on async khugepaged.
+        #[cfg(target_arch = "aarch64")]
+        const THP_SIZE: usize = 32 << 20;
+
+        #[cfg(target_arch = "aarch64")]
+        let mmap_size = region_size + THP_SIZE;
+        #[cfg(not(target_arch = "aarch64"))]
+        let mmap_size = region_size;
         // SAFETY: mmap_anonymous returns a page-aligned pointer or null.
         // MAP_NORESERVE means no physical memory is committed until pages are touched.
-        let ptr = unsafe { syscall::mmap_anonymous(region_size) };
-        if ptr.is_null() {
+        let raw = unsafe { syscall::mmap_anonymous(mmap_size) };
+        if raw.is_null() {
             std::process::abort();
         }
-        unsafe { syscall::madvise(ptr, region_size, syscall::MADV_NOHUGEPAGE) };
+
+        #[cfg(target_arch = "aarch64")]
+        let aligned_base = (raw as usize).next_multiple_of(THP_SIZE);
+        #[cfg(not(target_arch = "aarch64"))]
+        let aligned_base = raw as usize;
+
+        // On aarch64, ask khugepaged to use THP for the slab region. On x86_64
+        // preserve the historical NOHUGEPAGE hint (2 MiB THP can fragment slab
+        // release; documented original choice).
+        #[cfg(target_arch = "aarch64")]
+        let advice = syscall::MADV_HUGEPAGE;
+        #[cfg(not(target_arch = "aarch64"))]
+        let advice = syscall::MADV_NOHUGEPAGE;
+        unsafe { syscall::madvise(aligned_base as *mut u8, region_size, advice) };
+
+        // Eager pre-touch on aarch64: write one byte per 32 MiB hugepage across
+        // the first `pretouch_bytes` of every per-thread slab. Each write triggers
+        // a page fault that the kernel resolves into a 32 MiB THP given our
+        // MADV_HUGEPAGE hint and the 32 MiB-aligned base. Makes the THP win
+        // deterministic instead of khugepaged-async-dependent.
+        //
+        // Adapt `pretouch_bytes` to MemTotal so total pre-touch stays under
+        // MemTotal / OVERCOMMIT_GUARD (= 1/3 of RAM): on a 16 GiB Asahi M2 box,
+        // a hard-coded 1 GiB × 14 slabs = 14 GiB pre-touch over-commits and gets
+        // OOM-killed. Formula gives ~390 MiB per slab at 16 GiB, ~1 GiB at 64 GiB.
+        // Floor at THP_SIZE so we still pre-touch at least one hugepage if
+        // `total_ram_bytes()` returns 0 (stub or syscall failure).
+        #[cfg(target_arch = "aarch64")]
+        {
+            const PRETOUCH_HARD_CAP: usize = 1 << 30;
+            const OVERCOMMIT_GUARD: usize = 3;
+            // SAFETY: total_ram_bytes is allocation-free on platforms with a real
+            // impl, and the libc-fallback stub returns 0 without allocating.
+            let mem_total = unsafe { syscall::total_ram_bytes() };
+            let pretouch_bytes = if mem_total == 0 {
+                THP_SIZE
+            } else {
+                let budget = mem_total / max_threads / OVERCOMMIT_GUARD;
+                budget.clamp(THP_SIZE, PRETOUCH_HARD_CAP)
+            };
+            for slab_idx in 0..max_threads {
+                let slab_base = aligned_base + slab_idx * slab_size;
+                let mut off = 0;
+                while off < pretouch_bytes {
+                    // SAFETY: aligned_base..aligned_base+region_size is a valid
+                    // anonymous mmap reservation; we only touch within slab.
+                    unsafe {
+                        std::ptr::write_volatile((slab_base + off) as *mut u8, 0);
+                    }
+                    off += THP_SIZE;
+                }
+            }
+        }
+
         MAX_THREADS.store(max_threads, Ordering::Release);
         REGION_SIZE.store(region_size, Ordering::Release);
-        REGION_BASE.store(ptr as usize, Ordering::Release);
+        REGION_BASE.store(aligned_base, Ordering::Release);
     });
     REGION_BASE.load(Ordering::Acquire)
 }
