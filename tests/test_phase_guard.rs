@@ -14,7 +14,7 @@ static A: zk_alloc::ZkAllocator = zk_alloc::ZkAllocator;
 
 #[test]
 fn phase_guard_runs_end_phase_on_panic() {
-    let _lock = PHASE_LOCK.lock().unwrap();
+    let _lock = PHASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use std::panic;
 
     panic::set_hook(Box::new(|_| {}));
@@ -65,7 +65,7 @@ fn phase_guard_runs_end_phase_on_panic() {
 
 #[test]
 fn phase_guard_runs_end_phase_on_normal_return() {
-    let _lock = PHASE_LOCK.lock().unwrap();
+    let _lock = PHASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let v = zk_alloc::phase(|| vec![0xAB_u8; 8192]);
     // After phase, arena is inactive. Subsequent allocations go to System.
     let after: Vec<u8> = vec![0xCD_u8; 8192];
@@ -86,11 +86,10 @@ fn phase_guard_runs_end_phase_on_normal_return() {
 }
 
 #[test]
-fn nested_phase_guards_compose() {
-    let _lock = PHASE_LOCK.lock().unwrap();
-    // Outer phase + inner phase. Inner phase end_phases (sets active=false),
-    // then outer phase end_phases again. Sequence: begin, begin, end, end.
-    // Final state: active=false. No panic.
-    let result = zk_alloc::phase(|| zk_alloc::phase(|| 42_u64));
-    assert_eq!(result, 42);
+#[should_panic(expected = "phases must not nest")]
+fn nested_phase_guards_panic() {
+    let _lock = PHASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Phases are flat. `phase(|| phase(...))` calls begin_phase while
+    // the outer phase is still active, which trips the flat-phase assert.
+    let _ = zk_alloc::phase(|| zk_alloc::phase(|| 42_u64));
 }

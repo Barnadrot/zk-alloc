@@ -1,48 +1,25 @@
-//! hunt-1: Nested phases silently corrupt outer phase data.
+//! Contract test: nested `begin_phase()` calls panic.
 //!
-//! Hypothesis: nested `begin_phase()` calls bump GENERATION, which marks
-//! every thread's slab as needing reset. On the next allocation in the
-//! inner phase, ARENA_PTR is reset to the slab base — overwriting any
-//! data the outer phase had bump-allocated there.
+//! Phases are flat. A nested `begin_phase()` previously corrupted the outer
+//! phase's slab (later masked by a depth counter, which itself had failure
+//! modes — a panic between matched calls left the depth orphaned). The
+//! library now enforces the flat-phase contract with an assertion in
+//! `begin_phase()`: any second begin while a phase is active is a panic.
 //!
-//! There is no nesting counter. The inner `end_phase()` flips
-//! ARENA_ACTIVE to false, after which any allocations in the remainder
-//! of the outer phase silently land in System (a different correctness
-//! issue covered separately).
-//!
-//! Existing `tests/test_phase_guard.rs::nested_phase_guards_compose`
-//! only verifies that nested guards don't panic — it never allocates
-//! anything in the outer phase, so this corruption is invisible there.
+//! This test pins that behavior so a future depth-counter regression is
+//! caught at `cargo test`.
 
 #[global_allocator]
 static A: zk_alloc::ZkAllocator = zk_alloc::ZkAllocator;
 
 #[test]
-fn nested_phase_does_not_corrupt_outer() {
-    // Allocation big enough to land in arena (>= min_arena_bytes = 4096).
+#[should_panic(expected = "phases must not nest")]
+fn nested_begin_phase_panics() {
     zk_alloc::begin_phase();
-    let outer: Vec<u8> = vec![0xA1_u8; 8192];
-    let outer_ptr = outer.as_ptr() as usize;
-
-    // Nested begin_phase. GENERATION bumps; the next arena alloc on
-    // this thread will reset ARENA_PTR back to slab base.
+    // Second begin_phase while the first is still active must panic.
     zk_alloc::begin_phase();
-    let inner: Vec<u8> = vec![0xB2_u8; 8192];
-    let inner_ptr = inner.as_ptr() as usize;
-    let inner_first_byte = inner[0];
+    // Unreachable. Tearing down so a hypothetical non-panic doesn't leave
+    // ARENA_ACTIVE set across other tests.
     zk_alloc::end_phase();
-
     zk_alloc::end_phase();
-
-    eprintln!("outer_ptr=0x{outer_ptr:x} inner_ptr=0x{inner_ptr:x}");
-
-    // If nested phases are sound, outer's bytes are still 0xA1.
-    let pos = outer.iter().position(|&b| b != 0xA1);
-    let _ = inner_first_byte;
-    assert!(
-        pos.is_none(),
-        "outer phase data corrupted at offset {}: nested begin_phase bumped \
-         GENERATION and the inner allocation recycled the outer's slab region",
-        pos.unwrap()
-    );
 }

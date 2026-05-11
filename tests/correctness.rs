@@ -1,7 +1,13 @@
 use std::alloc::{GlobalAlloc, Layout};
+use std::sync::Mutex;
 use zk_alloc::ZkAllocator;
 
 static ZK: ZkAllocator = ZkAllocator;
+
+// Serializes tests that touch begin_phase()/end_phase(). The flat-phase
+// contract makes ARENA_ACTIVE shared state, so parallel test threads would
+// race and trip the nested-phase assert.
+static PHASE_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn small_alloc_returns_aligned_nonnull() {
@@ -85,6 +91,7 @@ fn realloc_preserves_data() {
 
 #[test]
 fn phase_boundary_does_not_crash() {
+    let _lock = PHASE_LOCK.lock().unwrap();
     let layout = Layout::from_size_align(128, 8).unwrap();
     for _ in 0..10 {
         let ptr = unsafe { ZK.alloc(layout) };
@@ -97,6 +104,7 @@ fn phase_boundary_does_not_crash() {
         assert!(!ptr.is_null());
         unsafe { ZK.dealloc(ptr, layout) };
     }
+    zk_alloc::end_phase();
 }
 
 #[test]
@@ -126,7 +134,7 @@ fn cross_thread_dealloc_does_not_crash() {
 
 #[test]
 fn arena_active_allocation() {
-    zk_alloc::begin_phase();
+    let _lock = PHASE_LOCK.lock().unwrap();
     zk_alloc::begin_phase();
 
     let layout = Layout::from_size_align(4096, 8).unwrap();

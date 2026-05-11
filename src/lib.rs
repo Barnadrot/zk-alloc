@@ -112,13 +112,6 @@ static MAX_THREADS: AtomicUsize = AtomicUsize::new(0);
 static OVERFLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static OVERFLOW_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-/// Nested-phase counter. `begin_phase()` increments it; `end_phase()`
-/// decrements. Only the outermost begin (0 → 1) bumps GENERATION and
-/// flips ARENA_ACTIVE; only the outermost end (1 → 0) deactivates.
-/// This makes nested `begin_phase()` calls compose without the inner
-/// begin recycling the outer phase's slab data.
-static PHASE_DEPTH: AtomicUsize = AtomicUsize::new(0);
-
 /// Allocations smaller than this go to System even during active phases.
 /// Routes registry / hashmap / injector-block-sized allocations away from
 /// the arena, so library state that outlives a phase doesn't land in
@@ -183,6 +176,17 @@ fn ensure_region() -> usize {
 /// Activates the arena and resets every thread's slab. All allocations until the next
 /// `end_phase()` go to the arena; the previous phase's data is overwritten in place.
 ///
+/// ## Phases must not nest
+///
+/// Calling `begin_phase()` while another phase is already active panics. The
+/// arena is a flat lifetime — nested phases were previously tolerated via a
+/// depth counter, but the depth counter masked correctness bugs (panics
+/// orphaning the count, accidental double-begin recycling the outer phase's
+/// slab on the next allocation). The contract is now: every `begin_phase()`
+/// is paired with one `end_phase()` (or use [`PhaseGuard`] / [`phase`] for
+/// panic-safe pairing), and no second `begin_phase()` is reachable from
+/// within an active phase.
+///
 /// ## Retention is unsafe
 ///
 /// Allocations made during phase N that are still held when phase N+1 begins
@@ -203,14 +207,12 @@ fn ensure_region() -> usize {
 /// or copy into a `Vec` allocated outside any phase).
 pub fn begin_phase() {
     ensure_region();
-    // Only the outermost begin bumps GENERATION and activates the arena.
-    // Nested begin_phase() calls just bump the depth counter; without this
-    // guard, an inner begin would recycle the slab and silently overwrite
-    // the outer phase's bump-allocated data.
-    if PHASE_DEPTH.fetch_add(1, Ordering::AcqRel) == 0 {
-        GENERATION.fetch_add(1, Ordering::Release);
-        ARENA_ACTIVE.store(true, Ordering::Release);
-    }
+    let prev_active = ARENA_ACTIVE.swap(true, Ordering::Release);
+    assert!(
+        !prev_active,
+        "begin_phase() called while another phase is already active — phases must not nest"
+    );
+    GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// Deactivates the arena. New allocations go to the system allocator; existing arena
@@ -219,23 +221,11 @@ pub fn begin_phase() {
 /// With the `rayon-flush` feature (default), this also drains rayon's internal
 /// queues to release any crossbeam-deque blocks allocated during the phase.
 ///
-/// Calls beyond the matching `begin_phase()` (i.e., when no phase is
-/// active) are tolerated and have no effect.
+/// Idempotent: calling `end_phase()` while no phase is active is a no-op.
 pub fn end_phase() {
-    // Only the outermost end (depth 1 → 0) tears down. Saturate at zero so
-    // unbalanced end_phase() calls are no-ops rather than wrapping around.
-    let prev = PHASE_DEPTH.fetch_update(Ordering::AcqRel, Ordering::Acquire, |d| {
-        if d == 0 {
-            None
-        } else {
-            Some(d - 1)
-        }
-    });
-    if let Ok(1) = prev {
-        ARENA_ACTIVE.store(false, Ordering::Release);
-        #[cfg(feature = "rayon-flush")]
-        flush_rayon();
-    }
+    ARENA_ACTIVE.store(false, Ordering::Release);
+    #[cfg(feature = "rayon-flush")]
+    flush_rayon();
 }
 
 /// Drains rayon's crossbeam-deque injector to release blocks allocated during
