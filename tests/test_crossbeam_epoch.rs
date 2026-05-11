@@ -13,9 +13,14 @@
 //! drive more retires, and assert program integrity over many cycles.
 
 use rayon::prelude::*;
+use std::sync::Mutex;
 
 #[global_allocator]
 static A: zk_alloc::ZkAllocator = zk_alloc::ZkAllocator;
+
+// Serialize phase-touching tests within this binary so they don't race on
+// ARENA_ACTIVE and trip the flat-phase assert.
+static PHASE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Force per-worker crossbeam-deque buffer growth via deep recursion. Each
 /// growth retires the prior buffer to crossbeam-epoch.
@@ -28,6 +33,7 @@ fn nested_join(depth: usize) {
 
 #[test]
 fn crossbeam_epoch_garbage_survives_phase_cycles() {
+    let _lock = PHASE_LOCK.lock().unwrap();
     let _: u64 = (0..1_000_000_u64).into_par_iter().sum();
 
     const CYCLES: usize = 50;
@@ -58,6 +64,7 @@ fn crossbeam_epoch_garbage_survives_phase_cycles() {
 /// rayon-heavy workloads survive 100 cycles.
 #[test]
 fn crossbeam_in_par_iter_collect_survives_cycles() {
+    let _lock = PHASE_LOCK.lock().unwrap();
     let _: u64 = (0..1_000_000_u64).into_par_iter().sum();
 
     for _ in 0..100 {

@@ -12,11 +12,9 @@
 //!      slab_base; we make it 4 KiB and fill with 0xD0. ARENA_PTR now sits
 //!      at slab_base + 4 KiB.
 //!   5. Realloc p1 to grow to 16 KiB. The arena fast path returns
-//!      ARENA_PTR = slab_base + 4 KiB, so:
-//!         src = [base, base+8K)        — bytes: 0xD0 (first 4K, py overwrote)
-//!                                                + 0xC1 (last 4K, untouched)
-//!         dst = [base+4K, base+12K)
-//!         overlap region = [base+4K, base+8K)   — 4 KiB
+//!      ARENA_PTR = slab_base + 4 KiB, so src = [base, base+8K) with bytes
+//!      0xD0 (first 4K, py overwrote) + 0xC1 (last 4K, untouched);
+//!      dst = [base+4K, base+12K); overlap = [base+4K, base+8K) (4 KiB).
 //!   6. Realloc executes `copy_nonoverlapping(src, dst, 8192)`. With glibc's
 //!      forward-direction memcpy this writes src's first half (0xD0) into
 //!      the overlap region, clobbering the upper half of src BEFORE it's
