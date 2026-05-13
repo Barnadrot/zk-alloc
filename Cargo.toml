@@ -1,10 +1,10 @@
 [package]
 name = "zk-alloc"
-version = "0.1.0"
+version = "0.0.9"
 edition = "2021"
 rust-version = "1.73"
 description = "Bump+reset arena allocator for ZK proving workloads"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/Barnadrot/zk-alloc"
 readme = "README.md"
 keywords = ["allocator", "arena", "zk", "proving", "memory"]
