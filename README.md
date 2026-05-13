@@ -45,7 +45,9 @@ need finer-grained control).
 
 Allocations made during phase N must not be held past `begin_phase()` of
 phase N+1 — that call recycles the slab, and the next allocation at the
-same offset overwrites the retained bytes. In practice:
+same offset overwrites the retained bytes. **Violating this contract is
+undefined behavior** (the old pointer becomes invalid the moment the
+overwrite happens). In practice:
 
 1. Drop or `clone()` arena-allocated values before the phase ends.
 2. Construct long-lived state (thread pools, channels, registries) *before*
@@ -57,8 +59,19 @@ same offset overwrites the retained bytes. In practice:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `ZK_ALLOC_SLAB_GB` | `8` | Per-thread slab size, in GiB. Raise for workloads that overflow (`overflow_stats()` reports the count). |
+| `ZK_ALLOC_SLAB_GB` | `8` | Per-thread slab size, in GiB. Raise for workloads that overflow (`overflow_stats()` reports the count). Total virtual reservation = `ZK_ALLOC_SLAB_GB × thread_count` (e.g., 8 GiB × 16 threads = 128 GiB virtual). Physical RAM is only consumed on touch. |
 | `ZK_ALLOC_MIN_BYTES` | `4096` | Size-routing threshold. Allocations smaller than this go to System even during a phase. Set to `0` to send everything to arena (loses size-routing protection against library-internal pooled allocations). |
+
+### Platform support
+
+| Platform | Path | Notes |
+|----------|------|-------|
+| Linux x86_64 | direct syscalls (`mmap`, `madvise`) | Fastest path. No libc allocator reentrancy concerns. |
+| Linux aarch64 | direct syscalls | **Requires `vm.overcommit_memory=1`** for `MAP_NORESERVE` to behave (Asahi/server-aarch64). Without it, large reservations SIGABRT. |
+| Other Unix (macOS, *BSD) | libc fallback (`mmap` via libc, `madvise` no-op) | Functional, slightly slower setup; no `MADV_NOHUGEPAGE` hint. |
+| Windows | no-op stubs | Allocator routes everything through System; arena is inert. Use System allocator directly here. |
+
+Minimum RAM: at least one slab's worth (default 8 GiB) of working set per active thread when phases run. On memory-constrained machines (e.g., 16 GiB M-series Macs), set `ZK_ALLOC_SLAB_GB` lower or limit thread count.
 
 ## Results
 
@@ -86,4 +99,4 @@ The technique is a 1990s bump allocator (Hanson, 1990) applied to a domain where
 
 ## License
 
-MIT
+Apache-2.0 — see [LICENSE](LICENSE) for the full text.
